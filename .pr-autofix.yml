@@ -13,4 +13,5 @@ exclude_paths:
 max_files_per_patch: 5
 
 bugbot_logins:
+  - "cursor"
   - "cursor[bot]"

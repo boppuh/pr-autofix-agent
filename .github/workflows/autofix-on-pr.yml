@@ -16,20 +16,22 @@ permissions:
   statuses: read
 
 concurrency:
-  group: pr-autofix-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: pr-autofix-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
   autofix:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.event.pull_request.number != null || github.event.issue.pull_request != null
+    # Skip fork PRs: secrets aren't available there, and the agent cannot push
+    # back to the fork's head ref.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Resolve PR head ref
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           data=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
@@ -53,7 +55,7 @@ jobs:
       - name: Install package dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          pip install -e ".[dev]"
 
       - name: Run agent
         env:
