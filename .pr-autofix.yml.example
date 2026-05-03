@@ -1,0 +1,26 @@
+# Drop this file (renamed to `.pr-autofix.yml`) at the root of any repo
+# that opts into pr-autofix-agent.
+
+# Commands run in order; first failing command stops the round and the
+# patch is reverted. Failure context is fed back to the LLM next round.
+validate:
+  - name: lint
+    run: ruff check .
+  - name: typecheck
+    run: mypy src
+  - name: test
+    run: pytest -x
+
+# Globs (fnmatch) the agent must never touch.
+exclude_paths:
+  - "migrations/**"
+  - "vendor/**"
+  - "**/*.generated.*"
+
+# Hard cap on files per individual patch.
+max_files_per_patch: 5
+
+# Author logins whose review threads count as "Bugbot". Override if your
+# Cursor instance posts under a different bot identity.
+bugbot_logins:
+  - "cursor[bot]"

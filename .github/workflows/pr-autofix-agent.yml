@@ -1,0 +1,105 @@
+name: PR Autofix Agent (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: PR number to operate on
+        required: true
+        type: number
+      max_rounds:
+        description: Maximum autofix rounds before escalating
+        required: false
+        type: number
+        default: 5
+      model:
+        description: Anthropic model id
+        required: false
+        type: string
+        default: claude-sonnet-4-6
+      dry_run:
+        description: If true, generate patches but do not commit/push
+        required: false
+        type: boolean
+        default: false
+      needs_human_label:
+        description: Label to apply on escalation
+        required: false
+        type: string
+        default: needs-human
+      confidence_threshold:
+        description: Minimum LLM classification confidence to attempt a fix
+        required: false
+        type: number
+        default: 0.7
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-autofix-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Resolve PR head ref
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          data=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ inputs.pr_number }}")
+          head_ref=$(echo "$data" | jq -r .head.ref)
+          head_sha=$(echo "$data" | jq -r .head.sha)
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pr-autofix-agent
+        run: |
+          python -m pip install --upgrade pip
+          # Pin via the calling repo's reference to this workflow.
+          pip install "git+https://github.com/${{ github.workflow_ref && github.repository_owner || github.repository_owner }}/pr-autofix-agent@${{ github.sha }}" \
+            || pip install "git+https://github.com/${{ github.repository_owner }}/pr-autofix-agent@main"
+
+      - name: Run agent
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MAX_ROUNDS: ${{ inputs.max_rounds }}
+          AGENT_MODEL: ${{ inputs.model }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          NEEDS_HUMAN_LABEL: ${{ inputs.needs_human_label }}
+          CONFIDENCE_THRESHOLD: ${{ inputs.confidence_threshold }}
+          GIT_AUTHOR_EMAIL: pr-autofix-agent@users.noreply.github.com
+        run: python -m pr_agent.run
+
+      - name: Upload run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-autofix-state-${{ inputs.pr_number }}
+          path: pr_agent_state.json
+          if-no-files-found: ignore
