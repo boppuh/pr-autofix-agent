@@ -47,24 +47,11 @@ def main(argv: list[str] | None = None) -> int:
     runtime_deadline = time.monotonic() + safety.max_runtime_minutes * 60
 
     gh = GitHubClient(gh_token, inputs.repo_full_name, repo_cfg.bugbot_logins)
-    llm = LLMClient(model=inputs.model, api_key=anthropic_key)
-    classifier = Classifier(
-        llm=llm,
-        protected_paths=repo_cfg.protected_paths,
-        confidence_threshold=inputs.confidence_threshold,
-    )
-    patcher = Patcher(
-        repo_root=repo_root,
-        protected_paths=repo_cfg.protected_paths,
-        max_files_touched=safety.max_files_touched,
-        max_patch_lines=safety.max_patch_lines,
-    )
-    validator = Validator(repo_root=repo_root, commands=repo_cfg.validate_)
 
-    pr = gh.get_pull(inputs.pr_number)
-    head_ref = pr.head.ref
-    last_failure: str | None = None
-
+    # Short-circuit before constructing any LLM-dependent component, so the
+    # Anthropic SDK is never instantiated without a key (defense in depth:
+    # current SDK versions defer key validation to first request, but future
+    # versions may raise at construction).
     if not anthropic_key:
         threads = gh.list_unresolved_bugbot_threads(inputs.pr_number)
         if threads:
@@ -84,6 +71,24 @@ def main(argv: list[str] | None = None) -> int:
             log.info("ANTHROPIC_API_KEY is not set, but no Bugbot threads to triage. Done.")
         gh.close()
         return 0
+
+    llm = LLMClient(model=inputs.model, api_key=anthropic_key)
+    classifier = Classifier(
+        llm=llm,
+        protected_paths=repo_cfg.protected_paths,
+        confidence_threshold=inputs.confidence_threshold,
+    )
+    patcher = Patcher(
+        repo_root=repo_root,
+        protected_paths=repo_cfg.protected_paths,
+        max_files_touched=safety.max_files_touched,
+        max_patch_lines=safety.max_patch_lines,
+    )
+    validator = Validator(repo_root=repo_root, commands=repo_cfg.validate_)
+
+    pr = gh.get_pull(inputs.pr_number)
+    head_ref = pr.head.ref
+    last_failure: str | None = None
 
     for round_no in range(1, max_rounds + 1):
         if time.monotonic() > runtime_deadline:
