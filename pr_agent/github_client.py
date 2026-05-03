@@ -137,10 +137,15 @@ def get_pr_diff(
             headers={"Accept": "application/vnd.github.v3.diff"},
         )
         resp.raise_for_status()
-        text = resp.text
-        if len(text) <= max_bytes:
-            return text
-        return text[:max_bytes] + f"\n... [truncated, original {len(text)} bytes] ..."
+        # Measure and slice on bytes (parameter is named max_bytes). resp.text
+        # is a decoded str; len(str) counts code points, which can mismatch
+        # byte size for non-ASCII content.
+        raw = resp.content
+        if len(raw) <= max_bytes:
+            return raw.decode("utf-8", errors="replace")
+        # Slicing UTF-8 mid-codepoint is fine because we tolerate replacement.
+        truncated = raw[:max_bytes].decode("utf-8", errors="replace")
+        return truncated + f"\n... [truncated, original {len(raw)} bytes] ..."
     finally:
         if own_close:
             client.close()

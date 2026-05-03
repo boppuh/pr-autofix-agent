@@ -119,8 +119,21 @@ def test_get_pr_diff_truncates(token):
     with respx.mock(base_url="https://api.github.com") as mock:
         mock.get("/repos/o/r/pulls/1").mock(return_value=httpx.Response(200, text=big))
         out = get_pr_diff("o", "r", 1, token=token, max_bytes=200)
-        assert len(out) <= 300  # 200 + truncation marker
         assert "truncated" in out
+        assert f"original {len(big.encode('utf-8'))} bytes" in out
+
+
+def test_get_pr_diff_truncates_on_bytes_not_chars(token):
+    """Regression: parameter is named max_bytes; non-ASCII content must be
+    measured and sliced in UTF-8 bytes, not Unicode code points."""
+    # Each '日' is 3 UTF-8 bytes but 1 char. 100 chars = 300 bytes.
+    big = "日" * 100
+    with respx.mock(base_url="https://api.github.com") as mock:
+        mock.get("/repos/o/r/pulls/1").mock(return_value=httpx.Response(200, text=big))
+        out = get_pr_diff("o", "r", 1, token=token, max_bytes=150)
+        # Truncation must fire because bytes (300) > limit (150).
+        assert "truncated" in out
+        assert "original 300 bytes" in out
 
 
 def test_resolve_thread_sends_mutation(token):
