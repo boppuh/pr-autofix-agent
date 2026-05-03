@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Literal
 
 from ._base import LLMProvider
 
 log = logging.getLogger(__name__)
-
-ProviderName = Literal["anthropic", "openai"]
 
 
 def make_provider(name: str, model: str, api_key: str | None) -> LLMProvider:
