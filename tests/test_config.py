@@ -44,6 +44,24 @@ def test_loads_defaults_when_file_missing(tmp_path):
     assert cfg.bugbot_logins == BUGBOT_AUTHOR_MATCHES
 
 
+def test_empty_lists_are_respected(tmp_path):
+    """Explicitly empty lists must not silently fall back to defaults."""
+    (tmp_path / ".pr-agent.yml").write_text(
+        textwrap.dedent(
+            """
+            validation:
+              commands: []
+            protected_paths: []
+            bugbot_logins: []
+            """
+        )
+    )
+    cfg = load_target_repo_config(tmp_path)
+    assert cfg.validate_ == []
+    assert cfg.protected_paths == []
+    assert cfg.bugbot_logins == []
+
+
 def test_overrides_via_yaml(tmp_path):
     (tmp_path / ".pr-agent.yml").write_text(
         textwrap.dedent(

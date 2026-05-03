@@ -62,7 +62,10 @@ def load_target_repo_config(repo_root: Path) -> TargetRepoConfig:
         raw = cast(dict[str, Any], loaded)
 
     validation_section: dict[str, Any] = raw.get("validation") or {}
-    commands_raw = validation_section.get("commands") or DEFAULT_VALIDATION_COMMANDS
+    # Use `is None` (not `or`) so users can intentionally set commands: [] etc.
+    commands_raw = validation_section.get("commands")
+    if commands_raw is None:
+        commands_raw = DEFAULT_VALIDATION_COMMANDS
     commands = [_normalize_command(c, idx) for idx, c in enumerate(commands_raw)]
 
     safety_raw: dict[str, Any] = raw.get("safety") or {}
@@ -74,8 +77,14 @@ def load_target_repo_config(repo_root: Path) -> TargetRepoConfig:
         max_runtime_minutes=safety_raw.get("max_runtime_minutes", MAX_RUNTIME_MINUTES),
     )
 
-    protected: list[str] = list(raw.get("protected_paths") or DEFAULT_PROTECTED_PATHS)
-    bugbot_logins: list[str] = list(raw.get("bugbot_logins") or BUGBOT_AUTHOR_MATCHES)
+    protected_raw = raw.get("protected_paths")
+    protected: list[str] = (
+        list(DEFAULT_PROTECTED_PATHS) if protected_raw is None else list(protected_raw)
+    )
+    bugbot_raw = raw.get("bugbot_logins")
+    bugbot_logins: list[str] = (
+        list(BUGBOT_AUTHOR_MATCHES) if bugbot_raw is None else list(bugbot_raw)
+    )
 
     try:
         return TargetRepoConfig.model_validate(

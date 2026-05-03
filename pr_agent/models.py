@@ -87,6 +87,8 @@ class EscalationReason(StrEnum):
     REPEATED_VALIDATION_FAILURE = "repeated_validation_failure"
     NO_FIXABLE_THREADS = "no_fixable_threads"
     UNSAFE_PATCH = "unsafe_patch"
+    RUNTIME_BUDGET_EXHAUSTED = "runtime_budget_exhausted"
+    MISSING_LLM_CREDENTIAL = "missing_llm_credential"
 
 
 class AgentRunReport(BaseModel):

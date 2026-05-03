@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import fnmatch
 import logging
 import re
 from dataclasses import dataclass
 
+from ._paths import matches_any_protected
 from .llm_client import LLMClient
 from .models import Classification, ClassificationLabel, ReviewThread
 
@@ -77,13 +77,7 @@ class Classifier:
         return None
 
     def _is_protected(self, path: str) -> bool:
-        for pat in self._protected_paths:
-            if pat.endswith("/"):
-                if path == pat.rstrip("/") or path.startswith(pat):
-                    return True
-            elif fnmatch.fnmatch(path, pat):
-                return True
-        return False
+        return matches_any_protected(path, self._protected_paths)
 
     def _apply_threshold(self, cls: Classification) -> Classification:
         if (

@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._paths import matches_any_protected
 from .models import Patch
 
 log = logging.getLogger(__name__)
@@ -68,7 +69,7 @@ class Patcher:
                 continue
             if any(fnmatch.fnmatch(f.path, pat) for pat in FORBIDDEN_GLOBS):
                 reasons.append(f"forbidden path: {f.path}")
-            if _matches_any_protected(f.path, self._protected):
+            if matches_any_protected(f.path, self._protected):
                 reasons.append(f"protected path: {f.path}")
         return PatchSafetyReport(ok=not reasons, reasons=reasons)
 
@@ -123,12 +124,3 @@ class Patcher:
         return result.stdout
 
 
-def _matches_any_protected(path: str, protected: list[str]) -> bool:
-    """A protected entry can be a directory prefix (ends with `/`) or a glob."""
-    for pat in protected:
-        if pat.endswith("/"):
-            if path == pat.rstrip("/") or path.startswith(pat):
-                return True
-        elif fnmatch.fnmatch(path, pat):
-            return True
-    return False

@@ -65,11 +65,31 @@ def main(argv: list[str] | None = None) -> int:
     head_ref = pr.head.ref
     last_failure: str | None = None
 
+    if not anthropic_key:
+        threads = gh.list_unresolved_bugbot_threads(inputs.pr_number)
+        if threads:
+            log.warning(
+                "ANTHROPIC_API_KEY is not set; cannot triage %d Bugbot thread(s). "
+                "Escalating without LLM calls.",
+                len(threads),
+            )
+            _escalate(
+                gh,
+                inputs,
+                state,
+                EscalationReason.MISSING_LLM_CREDENTIAL,
+                [t.id for t in threads],
+            )
+        else:
+            log.info("ANTHROPIC_API_KEY is not set, but no Bugbot threads to triage. Done.")
+        gh.close()
+        return 0
+
     for round_no in range(1, max_rounds + 1):
         if time.monotonic() > runtime_deadline:
             log.warning("Runtime budget (%dm) exhausted.", safety.max_runtime_minutes)
             unresolved = [t.id for t in gh.list_unresolved_bugbot_threads(inputs.pr_number)]
-            _escalate(gh, inputs, state, EscalationReason.MAX_ROUNDS, unresolved)
+            _escalate(gh, inputs, state, EscalationReason.RUNTIME_BUDGET_EXHAUSTED, unresolved)
             gh.close()
             return 0
 
