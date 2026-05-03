@@ -223,7 +223,13 @@ def resolve_thread(
     http: httpx.Client | None = None,
 ) -> None:
     """Mark a review thread as resolved via GraphQL."""
-    _graphql(http or _http(token), _RESOLVE_MUTATION, {"threadId": thread_id}, own_close=http is None)
+    client = http or _http(token)
+    own_close = http is None
+    try:
+        _graphql(client, _RESOLVE_MUTATION, {"threadId": thread_id})
+    finally:
+        if own_close:
+            client.close()
 
 
 def create_pr_comment(
@@ -416,20 +422,17 @@ def _graphql(
     client: httpx.Client,
     query: str,
     variables: dict[str, Any],
-    *,
-    own_close: bool = False,
 ) -> dict[str, Any]:
-    try:
-        resp = client.post(GRAPHQL_URL, json={"query": query, "variables": variables})
-        resp.raise_for_status()
-        payload = resp.json()
-        if "errors" in payload:
-            raise RuntimeError(f"GraphQL errors: {payload['errors']}")
-        data: dict[str, Any] = payload["data"]
-        return data
-    finally:
-        if own_close:
-            client.close()
+    """Issue a GraphQL POST. Caller is responsible for the client lifecycle —
+    keeping close() out of this function so the @retry decorator can reuse the
+    client across attempts."""
+    resp = client.post(GRAPHQL_URL, json={"query": query, "variables": variables})
+    resp.raise_for_status()
+    payload = resp.json()
+    if "errors" in payload:
+        raise RuntimeError(f"GraphQL errors: {payload['errors']}")
+    data: dict[str, Any] = payload["data"]
+    return data
 
 
 def _thread_from_node(node: dict[str, Any]) -> ReviewThread:

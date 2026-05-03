@@ -198,6 +198,24 @@ def test_get_check_runs(token):
         assert runs[1].conclusion is None
 
 
+def test_resolve_thread_retries_through_transient_errors(token):
+    """Regression: a transient HTTPError on the first attempt must not close
+    the client mid-retry. Tenacity should reuse the client and the second
+    attempt should succeed (not blow up with 'client has been closed')."""
+    success = {
+        "data": {"resolveReviewThread": {"thread": {"id": "T1", "isResolved": True}}}
+    }
+    with respx.mock(base_url="https://api.github.com") as mock:
+        route = mock.post("/graphql").mock(
+            side_effect=[
+                httpx.Response(502, text="bad gateway"),
+                httpx.Response(200, json=success),
+            ]
+        )
+        resolve_thread("T1", token=token)
+        assert route.call_count == 2
+
+
 def test_class_wrapper_delegates(token):
     with respx.mock(base_url="https://api.github.com") as mock:
         mock.post("/graphql").mock(
