@@ -145,7 +145,8 @@ class CheckRun(BaseModel):
 class WorkflowInputs(BaseModel):
     pr_number: int
     max_rounds: int = 5
-    model: str = "claude-sonnet-4-6"
+    provider: Literal["anthropic", "openai"] = "anthropic"
+    model: str | None = None  # None = pick default for the provider
     dry_run: bool = False
     repo_full_name: str
     needs_human_label: str = "needs-human"

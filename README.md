@@ -5,7 +5,7 @@ Autonomous GitHub PR autofix agent for Cursor Bugbot review threads.
 It runs as a **reusable GitHub Actions workflow** plus a small Python agent that:
 
 1. Lists unresolved Bugbot threads on a PR (GraphQL).
-2. Triages each thread: rule-layer skip for architectural / protected paths, then an LLM classifier (Anthropic Claude) with a confidence threshold.
+2. Triages each thread: rule-layer skip for architectural / protected paths, then an LLM classifier (Anthropic Claude or OpenAI GPT/Codex — pluggable) with a confidence threshold.
 3. Generates minimal patches for auto-fixable threads, restricted to a configured file/line budget and forbidden-path allowlist.
 4. Runs target-repo validators (`.pr-agent.yml` → `validation.commands`); reverts the patch on failure and feeds the failure into the next round.
 5. Commits, pushes, replies to the thread, and resolves it via GraphQL.
@@ -39,9 +39,15 @@ jobs:
     uses: <your-org>/pr-autofix-agent/.github/workflows/pr-autofix-agent.yml@v1
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+    with:
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      provider: anthropic  # or "openai"
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 ```
+
+> Set whichever secret matches your `provider:`. The other can be omitted.
 
 The reusable workflow uses the standard `GITHUB_TOKEN`. **It never uses `pull_request_target`** — patches are applied to the PR head ref under least-privilege scopes.
 
@@ -65,7 +71,8 @@ The reusable workflow uses the standard `GITHUB_TOKEN`. **It never uses `pull_re
 | --- | --- | --- |
 | `pr_number` | _required_ | PR to operate on |
 | `max_rounds` | `5` | Cap on autofix rounds (further capped by `safety.max_rounds`) |
-| `model` | `claude-sonnet-4-6` | Anthropic model id |
+| `provider` | `anthropic` | LLM provider — `anthropic` or `openai` |
+| `model` | provider default | Provider-specific model id (defaults: `claude-sonnet-4-6` / `gpt-5-codex`) |
 | `dry_run` | `false` | Generate patches but skip commit/push |
 | `needs_human_label` | `needs-human` | Label applied on escalation |
 | `confidence_threshold` | `0.7` | Minimum classifier confidence to attempt a fix |
@@ -95,6 +102,11 @@ mypy pr_agent
 Dry run against a real PR (read-only):
 
 ```sh
+# Anthropic (default)
 GITHUB_TOKEN=... ANTHROPIC_API_KEY=... \
   python -m pr_agent.run --repo owner/repo --pr 123 --dry-run
+
+# OpenAI
+GITHUB_TOKEN=... OPENAI_API_KEY=... \
+  python -m pr_agent.run --repo owner/repo --pr 123 --provider openai --dry-run
 ```
