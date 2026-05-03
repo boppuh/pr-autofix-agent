@@ -73,8 +73,19 @@ class LLMClient:
         file_contents: dict[str, str],
         max_files: int,
         prior_failure: str | None = None,
+        pr_title: str | None = None,
+        pr_body_excerpt: str | None = None,
+        pr_diff_excerpt: str | None = None,
     ) -> Patch:
-        user = _format_patch_user(thread, file_contents, max_files, prior_failure)
+        user = _format_patch_user(
+            thread,
+            file_contents,
+            max_files,
+            prior_failure,
+            pr_title=pr_title,
+            pr_body_excerpt=pr_body_excerpt,
+            pr_diff_excerpt=pr_diff_excerpt,
+        )
         text = self._call(system=_PATCH_SYSTEM, user=user, max_tokens=4000)
         data = _extract_json(text)
         files_raw = data.get("files") or []
@@ -123,8 +134,26 @@ def _format_patch_user(
     file_contents: dict[str, str],
     max_files: int,
     prior_failure: str | None,
+    *,
+    pr_title: str | None = None,
+    pr_body_excerpt: str | None = None,
+    pr_diff_excerpt: str | None = None,
 ) -> str:
-    parts = [
+    parts: list[str] = []
+    if pr_title:
+        parts += [f"PR title: {pr_title}"]
+    if pr_body_excerpt:
+        parts += ["", "PR description:", pr_body_excerpt]
+    if pr_diff_excerpt:
+        parts += [
+            "",
+            "PR diff (truncated):",
+            "```diff",
+            pr_diff_excerpt,
+            "```",
+        ]
+    parts += [
+        "",
         f"Thread path: {thread.path or '(none)'}",
         f"Thread line: {thread.line if thread.line is not None else '(none)'}",
         f"File budget: at most {max_files} file(s).",
@@ -132,6 +161,8 @@ def _format_patch_user(
         "Comment thread:",
         thread.body_text,
     ]
+    if thread.comments and thread.comments[0].diff_hunk:
+        parts += ["", "Diff hunk for the thread:", "```diff", thread.comments[0].diff_hunk, "```"]
     if prior_failure:
         parts += [
             "",

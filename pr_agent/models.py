@@ -13,6 +13,8 @@ class BugbotComment(BaseModel):
     body: str
     path: str | None = None
     line: int | None = None
+    original_line: int | None = None
+    diff_hunk: str | None = None
     created_at: datetime
 
 
@@ -121,6 +123,23 @@ class TargetRepoConfig(BaseModel):
     bugbot_logins: list[str] = Field(default_factory=lambda: ["cursor", "bugbot", "cursor-bugbot"])
 
     model_config = {"populate_by_name": True}
+
+
+class PullRequest(BaseModel):
+    id: str
+    number: int
+    title: str
+    body: str = ""
+    head_ref_name: str
+    head_ref_oid: str
+    base_ref_name: str
+    threads: list[ReviewThread] = Field(default_factory=list)
+
+
+class CheckRun(BaseModel):
+    name: str
+    status: str  # queued | in_progress | completed
+    conclusion: str | None = None  # success | failure | neutral | cancelled | timed_out | action_required | skipped
 
 
 class WorkflowInputs(BaseModel):

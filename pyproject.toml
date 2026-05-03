@@ -17,6 +17,7 @@ dependencies = [
 dev = [
     "pytest>=8.2",
     "pytest-mock>=3.14",
+    "respx>=0.21",
     "ruff>=0.5",
     "mypy>=1.10",
     "types-PyYAML",

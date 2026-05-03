@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     max_rounds = min(inputs.max_rounds, safety.max_rounds)
     runtime_deadline = time.monotonic() + safety.max_runtime_minutes * 60
 
-    gh = GitHubClient(gh_token, inputs.repo_full_name, repo_cfg.bugbot_logins)
+    gh = GitHubClient.from_full_name(gh_token, inputs.repo_full_name)
     llm = LLMClient(model=inputs.model, api_key=anthropic_key)
     classifier = Classifier(
         llm=llm,
@@ -61,12 +61,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     validator = Validator(repo_root=repo_root, commands=repo_cfg.validate_)
 
-    pr = gh.get_pull(inputs.pr_number)
-    head_ref = pr.head.ref
+    pr = gh.get_pr(inputs.pr_number)
+    head_ref = pr.head_ref_name
+    pr_diff = gh.get_pr_diff(inputs.pr_number)
     last_failure: str | None = None
 
     if not anthropic_key:
-        threads = gh.list_unresolved_bugbot_threads(inputs.pr_number)
+        threads = gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)
         if threads:
             log.warning(
                 "ANTHROPIC_API_KEY is not set; cannot triage %d Bugbot thread(s). "
@@ -88,13 +89,13 @@ def main(argv: list[str] | None = None) -> int:
     for round_no in range(1, max_rounds + 1):
         if time.monotonic() > runtime_deadline:
             log.warning("Runtime budget (%dm) exhausted.", safety.max_runtime_minutes)
-            unresolved = [t.id for t in gh.list_unresolved_bugbot_threads(inputs.pr_number)]
+            unresolved = [t.id for t in gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)]
             _escalate(gh, inputs, state, EscalationReason.RUNTIME_BUDGET_EXHAUSTED, unresolved)
             gh.close()
             return 0
 
         log.info("=== round %d/%d ===", round_no, max_rounds)
-        threads = gh.list_unresolved_bugbot_threads(inputs.pr_number)
+        threads = gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)
         if not threads:
             log.info("No unresolved Bugbot threads. Done.")
             break
@@ -127,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
                 file_contents=file_contents,
                 max_files=safety.max_files_touched,
                 prior_failure=last_failure,
+                pr_title=pr.title,
+                pr_body_excerpt=pr.body[:2000] if pr.body else None,
+                pr_diff_excerpt=pr_diff,
             )
             try:
                 report = patcher.check_safe(patch)
@@ -196,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         state.record_round(round_result)
         last_failure = None
     else:
-        unresolved = [t.id for t in gh.list_unresolved_bugbot_threads(inputs.pr_number)]
+        unresolved = [t.id for t in gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)]
         _escalate(gh, inputs, state, EscalationReason.MAX_ROUNDS, unresolved)
 
     gh.close()
@@ -254,8 +258,8 @@ def _escalate(
 ) -> None:
     state.escalate(reason, unresolved)
     try:
-        gh.add_label(inputs.pr_number, inputs.needs_human_label)
-        gh.post_pr_comment(
+        gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
+        gh.create_pr_comment(
             inputs.pr_number,
             f"🤖 **pr-autofix-agent** is escalating to a human reviewer.\n\n"
             f"Reason: `{reason.value}`\n"
