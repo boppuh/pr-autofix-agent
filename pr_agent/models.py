@@ -87,6 +87,8 @@ class EscalationReason(StrEnum):
     REPEATED_VALIDATION_FAILURE = "repeated_validation_failure"
     NO_FIXABLE_THREADS = "no_fixable_threads"
     UNSAFE_PATCH = "unsafe_patch"
+    RUNTIME_BUDGET_EXHAUSTED = "runtime_budget_exhausted"
+    MISSING_LLM_CREDENTIAL = "missing_llm_credential"
 
 
 class AgentRunReport(BaseModel):
@@ -102,13 +104,21 @@ class ValidateCommand(BaseModel):
     run: str
 
 
+class SafetyLimits(BaseModel):
+    max_rounds: int = 5
+    max_comments_per_round: int = 20
+    max_patch_lines: int = 800
+    max_files_touched: int = 15
+    max_runtime_minutes: int = 20
+
+
 class TargetRepoConfig(BaseModel):
-    """Schema for the target repo's `.pr-autofix.yml`."""
+    """Schema for the target repo's `.pr-agent.yml`."""
 
     validate_: list[ValidateCommand] = Field(default_factory=list, alias="validate")
-    exclude_paths: list[str] = Field(default_factory=list)
-    max_files_per_patch: int = 5
-    bugbot_logins: list[str] = Field(default_factory=lambda: ["cursor", "cursor[bot]"])
+    protected_paths: list[str] = Field(default_factory=list)
+    safety: SafetyLimits = Field(default_factory=SafetyLimits)
+    bugbot_logins: list[str] = Field(default_factory=lambda: ["cursor", "bugbot", "cursor-bugbot"])
 
     model_config = {"populate_by_name": True}
 
