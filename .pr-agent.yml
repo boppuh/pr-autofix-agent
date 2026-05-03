@@ -1,0 +1,26 @@
+validation:
+  commands:
+    - ruff check .
+    - mypy pr_agent
+    - pytest -x
+
+safety:
+  max_rounds: 5
+  max_comments_per_round: 20
+  max_patch_lines: 800
+  max_files_touched: 15
+  max_runtime_minutes: 20
+
+protected_paths:
+  - ".github/workflows/"
+  - "infra/"
+  - "migrations/"
+  - "secrets/"
+  - ".venv/"
+  - ".pr-agent.yml"
+
+bugbot_logins:
+  - "cursor"
+  - "bugbot"
+  - "cursor-bugbot"
+  - "cursor[bot]"
