@@ -5,15 +5,15 @@ Autonomous GitHub PR autofix agent for Cursor Bugbot review threads.
 It runs as a **reusable GitHub Actions workflow** plus a small Python agent that:
 
 1. Lists unresolved Bugbot threads on a PR (GraphQL).
-2. Triages each thread: rule-layer skip for architectural / excluded paths, then an LLM classifier (Anthropic Claude) with a confidence threshold.
-3. Generates minimal patches for auto-fixable threads, restricted to a configured file budget and forbidden-path allowlist.
-4. Runs target-repo validators (`.pr-autofix.yml` → `validate:`); reverts the patch on failure and feeds the failure into the next round.
+2. Triages each thread: rule-layer skip for architectural / protected paths, then an LLM classifier (Anthropic Claude) with a confidence threshold.
+3. Generates minimal patches for auto-fixable threads, restricted to a configured file/line budget and forbidden-path allowlist.
+4. Runs target-repo validators (`.pr-agent.yml` → `validation.commands`); reverts the patch on failure and feeds the failure into the next round.
 5. Commits, pushes, replies to the thread, and resolves it via GraphQL.
-6. Loops up to `max_rounds` (default 5); on hitting the limit or repeated identical validation failures it labels the PR `needs-human` and posts an escalation comment.
+6. Loops up to `safety.max_rounds` (default 5); on hitting the limit, exhausting `safety.max_runtime_minutes`, or repeated identical validation failures it labels the PR `needs-human` and posts an escalation comment.
 
 ## Installing in a target repo
 
-1. Create `.pr-autofix.yml` at the repo root (see `.pr-autofix.yml.example`).
+1. Optionally create `.pr-agent.yml` at the repo root (see `.pr-agent.yml.example`). Defaults: npm validation commands, standard `protected_paths`, Bugbot logins `cursor` / `bugbot` / `cursor-bugbot`.
 2. Add a calling workflow:
 
 ```yaml
@@ -47,8 +47,11 @@ The reusable workflow uses the standard `GITHUB_TOKEN`. **It never uses `pull_re
 
 ## Safety rails
 
-- Patch path allowlist; rejects `.github/workflows/*`, lockfiles, `.pr-autofix.yml` itself, anything in `exclude_paths`, and any `..` traversal.
-- `max_files_per_patch` cap (default 5).
+- Patch path allowlist; rejects `.github/workflows/*`, lockfiles, `.pr-agent.yml` itself, anything in `protected_paths`, and any `..` traversal.
+- `safety.max_files_touched` cap (default 15).
+- `safety.max_patch_lines` cap on total new content (default 800).
+- `safety.max_comments_per_round` cap on threads handled per round (default 20).
+- `safety.max_runtime_minutes` overall budget (default 20); escalates on exhaustion.
 - Architectural-keyword regex skip (rule layer, not LLM-trustable).
 - Confidence threshold on LLM triage (default 0.7).
 - No push if any validator fails — the patch is reverted.
@@ -61,20 +64,24 @@ The reusable workflow uses the standard `GITHUB_TOKEN`. **It never uses `pull_re
 | Workflow input | Default | Description |
 | --- | --- | --- |
 | `pr_number` | _required_ | PR to operate on |
-| `max_rounds` | `5` | Max autofix rounds before escalation |
+| `max_rounds` | `5` | Cap on autofix rounds (further capped by `safety.max_rounds`) |
 | `model` | `claude-sonnet-4-6` | Anthropic model id |
 | `dry_run` | `false` | Generate patches but skip commit/push |
 | `needs_human_label` | `needs-human` | Label applied on escalation |
 | `confidence_threshold` | `0.7` | Minimum classifier confidence to attempt a fix |
 
-`.pr-autofix.yml` (in target repo):
+`.pr-agent.yml` (in target repo, all sections optional):
 
 | Key | Description |
 | --- | --- |
-| `validate` | Ordered list of `{name, run}` shell commands; first failure stops the round |
-| `exclude_paths` | fnmatch globs the agent must never touch |
-| `max_files_per_patch` | Hard cap on files modified per patch (default 5) |
-| `bugbot_logins` | Author logins counted as Bugbot (default `["cursor[bot]"]`) |
+| `validation.commands` | Ordered list of strings or `{name, run}` mappings; first failure stops the round (default: `npm test`, `npm run lint`, `npm run typecheck`) |
+| `safety.max_rounds` | Round cap (default 5) |
+| `safety.max_comments_per_round` | Threads handled per round (default 20) |
+| `safety.max_patch_lines` | Total new lines per patch (default 800) |
+| `safety.max_files_touched` | Files per patch (default 15) |
+| `safety.max_runtime_minutes` | Hard wall-clock budget (default 20) |
+| `protected_paths` | Trailing-slash dir prefixes or fnmatch globs the agent must never touch |
+| `bugbot_logins` | Author logins counted as Bugbot (default `["cursor", "bugbot", "cursor-bugbot"]`) |
 
 ## Local dev
 

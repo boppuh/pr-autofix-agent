@@ -1,15 +1,45 @@
+"""Config constants, defaults, and `.pr-agent.yml` loader."""
+
 from __future__ import annotations
 
 import argparse
 import os
 from pathlib import Path
+from typing import Any, cast
 
 import yaml
 from pydantic import ValidationError
 
-from .models import TargetRepoConfig, WorkflowInputs
+from .models import SafetyLimits, TargetRepoConfig, ValidateCommand, WorkflowInputs
 
-DEFAULT_CONFIG_FILENAME = ".pr-autofix.yml"
+# --- Hard-coded defaults (overridable via .pr-agent.yml) ---
+
+MAX_ROUNDS = 5
+MAX_COMMENTS_PER_ROUND = 20
+MAX_PATCH_LINES = 800
+MAX_FILES_TOUCHED = 15
+MAX_RUNTIME_MINUTES = 20
+
+BUGBOT_AUTHOR_MATCHES: list[str] = [
+    "cursor",
+    "bugbot",
+    "cursor-bugbot",
+]
+
+DEFAULT_VALIDATION_COMMANDS: list[str] = [
+    "npm test",
+    "npm run lint",
+    "npm run typecheck",
+]
+
+DEFAULT_PROTECTED_PATHS: list[str] = [
+    ".github/workflows/",
+    "infra/",
+    "migrations/",
+    "secrets/",
+]
+
+DEFAULT_CONFIG_FILENAME = ".pr-agent.yml"
 
 
 class ConfigError(Exception):
@@ -17,22 +47,55 @@ class ConfigError(Exception):
 
 
 def load_target_repo_config(repo_root: Path) -> TargetRepoConfig:
+    """Load `.pr-agent.yml` from the target repo, applying spec defaults.
+
+    The file is optional: if missing, defaults are used (npm validation commands,
+    standard protected paths, BUGBOT_AUTHOR_MATCHES). All fields under
+    `validation:` and `safety:` may be overridden.
+    """
     path = repo_root / DEFAULT_CONFIG_FILENAME
-    if not path.exists():
-        raise ConfigError(
-            f"Missing {DEFAULT_CONFIG_FILENAME} at repo root ({repo_root}). "
-            "Create one with at least a `validate:` list."
-        )
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw: dict[str, Any] = {}
+    if path.exists():
+        loaded = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(loaded, dict):
+            raise ConfigError(f"{DEFAULT_CONFIG_FILENAME} must be a YAML mapping.")
+        raw = cast(dict[str, Any], loaded)
+
+    validation_section: dict[str, Any] = raw.get("validation") or {}
+    commands_raw = validation_section.get("commands") or DEFAULT_VALIDATION_COMMANDS
+    commands = [_normalize_command(c, idx) for idx, c in enumerate(commands_raw)]
+
+    safety_raw: dict[str, Any] = raw.get("safety") or {}
+    safety = SafetyLimits(
+        max_rounds=safety_raw.get("max_rounds", MAX_ROUNDS),
+        max_comments_per_round=safety_raw.get("max_comments_per_round", MAX_COMMENTS_PER_ROUND),
+        max_patch_lines=safety_raw.get("max_patch_lines", MAX_PATCH_LINES),
+        max_files_touched=safety_raw.get("max_files_touched", MAX_FILES_TOUCHED),
+        max_runtime_minutes=safety_raw.get("max_runtime_minutes", MAX_RUNTIME_MINUTES),
+    )
+
+    protected: list[str] = list(raw.get("protected_paths") or DEFAULT_PROTECTED_PATHS)
+    bugbot_logins: list[str] = list(raw.get("bugbot_logins") or BUGBOT_AUTHOR_MATCHES)
+
     try:
-        cfg = TargetRepoConfig.model_validate(raw)
+        return TargetRepoConfig.model_validate(
+            {
+                "validate": commands,
+                "protected_paths": protected,
+                "safety": safety,
+                "bugbot_logins": bugbot_logins,
+            }
+        )
     except ValidationError as e:
         raise ConfigError(f"Invalid {DEFAULT_CONFIG_FILENAME}: {e}") from e
-    if not cfg.validate_:
-        raise ConfigError(
-            f"{DEFAULT_CONFIG_FILENAME} must declare at least one `validate:` command."
-        )
-    return cfg
+
+
+def _normalize_command(c: object, idx: int) -> ValidateCommand:
+    if isinstance(c, str):
+        return ValidateCommand(name=f"step{idx + 1}", run=c)
+    if isinstance(c, dict) and "run" in c:
+        return ValidateCommand(name=str(c.get("name") or f"step{idx + 1}"), run=str(c["run"]))
+    raise ConfigError(f"validation.commands[{idx}] must be a string or {{name, run}} mapping.")
 
 
 def load_workflow_inputs(argv: list[str] | None = None) -> WorkflowInputs:
@@ -57,7 +120,7 @@ def load_workflow_inputs(argv: list[str] | None = None) -> WorkflowInputs:
 
     return WorkflowInputs(
         pr_number=pr_number,
-        max_rounds=args.max_rounds or _int_env("MAX_ROUNDS") or 5,
+        max_rounds=args.max_rounds or _int_env("MAX_ROUNDS") or MAX_ROUNDS,
         model=args.model or os.environ.get("AGENT_MODEL") or "claude-sonnet-4-6",
         dry_run=args.dry_run or _bool_env("DRY_RUN"),
         repo_full_name=repo,

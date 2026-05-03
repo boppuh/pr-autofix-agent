@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 FORBIDDEN_GLOBS = [
     ".github/workflows/*",
-    ".pr-autofix.yml",
+    ".pr-agent.yml",
     "*.lock",
     "package-lock.json",
     "yarn.lock",
@@ -35,10 +35,17 @@ class PatchSafetyReport:
 
 
 class Patcher:
-    def __init__(self, repo_root: Path, exclude_paths: list[str], max_files_per_patch: int):
+    def __init__(
+        self,
+        repo_root: Path,
+        protected_paths: list[str],
+        max_files_touched: int,
+        max_patch_lines: int,
+    ):
         self._root = repo_root.resolve()
-        self._exclude = exclude_paths
-        self._max_files = max_files_per_patch
+        self._protected = protected_paths
+        self._max_files = max_files_touched
+        self._max_patch_lines = max_patch_lines
 
     def check_safe(self, patch: Patch) -> PatchSafetyReport:
         reasons: list[str] = []
@@ -46,6 +53,9 @@ class Patcher:
             reasons.append("empty patch")
         if len(patch.files) > self._max_files:
             reasons.append(f"too many files ({len(patch.files)} > {self._max_files})")
+        total_lines = sum(f.new_content.count("\n") + 1 for f in patch.files)
+        if total_lines > self._max_patch_lines:
+            reasons.append(f"patch too large ({total_lines} > {self._max_patch_lines} lines)")
         for f in patch.files:
             if Path(f.path).is_absolute() or ".." in Path(f.path).parts:
                 reasons.append(f"non-relative path: {f.path}")
@@ -58,8 +68,8 @@ class Patcher:
                 continue
             if any(fnmatch.fnmatch(f.path, pat) for pat in FORBIDDEN_GLOBS):
                 reasons.append(f"forbidden path: {f.path}")
-            if any(fnmatch.fnmatch(f.path, pat) for pat in self._exclude):
-                reasons.append(f"excluded path: {f.path}")
+            if _matches_any_protected(f.path, self._protected):
+                reasons.append(f"protected path: {f.path}")
         return PatchSafetyReport(ok=not reasons, reasons=reasons)
 
     def apply(self, patch: Patch) -> list[Path]:
@@ -111,3 +121,14 @@ class Patcher:
                 f"{result.stderr.strip()}"
             )
         return result.stdout
+
+
+def _matches_any_protected(path: str, protected: list[str]) -> bool:
+    """A protected entry can be a directory prefix (ends with `/`) or a glob."""
+    for pat in protected:
+        if pat.endswith("/"):
+            if path == pat.rstrip("/") or path.startswith(pat):
+                return True
+        elif fnmatch.fnmatch(path, pat):
+            return True
+    return False

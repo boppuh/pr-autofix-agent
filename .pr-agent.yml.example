@@ -1,0 +1,37 @@
+# Drop this file (renamed to `.pr-agent.yml`) at the root of any repo
+# that opts into pr-autofix-agent. The whole file is optional — sensible
+# defaults apply if it's missing (npm validation commands, standard
+# protected_paths, BUGBOT_AUTHOR_MATCHES).
+
+# Commands run in order; first failing command stops the round and the
+# patch is reverted. Failure context is fed back to the LLM next round.
+# Each entry can be a string OR {name, run}.
+validation:
+  commands:
+    - npm test
+    - npm run lint
+    - npm run typecheck
+
+# Hard runtime caps. Any field you omit falls back to the constants in
+# pr_agent/config.py.
+safety:
+  max_rounds: 5
+  max_comments_per_round: 20
+  max_patch_lines: 800
+  max_files_touched: 15
+  max_runtime_minutes: 20
+
+# Paths the agent must never touch. Trailing-slash entries are treated as
+# directory prefixes; everything else is fnmatch.
+protected_paths:
+  - ".github/workflows/"
+  - "infra/"
+  - "migrations/"
+  - "secrets/"
+
+# Author logins whose review threads count as "Bugbot". Defaults to
+# ["cursor", "bugbot", "cursor-bugbot"].
+bugbot_logins:
+  - "cursor"
+  - "bugbot"
+  - "cursor-bugbot"

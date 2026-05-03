@@ -38,11 +38,11 @@ class Classifier:
     def __init__(
         self,
         llm: LLMClient,
-        exclude_paths: list[str],
+        protected_paths: list[str],
         confidence_threshold: float = 0.7,
     ):
         self._llm = llm
-        self._exclude_paths = exclude_paths
+        self._protected_paths = protected_paths
         self._confidence_threshold = confidence_threshold
 
     def triage(
@@ -67,8 +67,8 @@ class Classifier:
         return TriageOutcome(fixable=fixable, skipped=skipped)
 
     def _rule_layer(self, thread: ReviewThread) -> str | None:
-        if thread.path and self._is_excluded(thread.path):
-            return f"path excluded by config: {thread.path}"
+        if thread.path and self._is_protected(thread.path):
+            return f"protected path: {thread.path}"
         body = thread.body_text
         if _ARCH_RE.search(body):
             return "architectural keyword match"
@@ -76,8 +76,14 @@ class Classifier:
             return "comment too long for safe auto-fix"
         return None
 
-    def _is_excluded(self, path: str) -> bool:
-        return any(fnmatch.fnmatch(path, pat) for pat in self._exclude_paths)
+    def _is_protected(self, path: str) -> bool:
+        for pat in self._protected_paths:
+            if pat.endswith("/"):
+                if path == pat.rstrip("/") or path.startswith(pat):
+                    return True
+            elif fnmatch.fnmatch(path, pat):
+                return True
+        return False
 
     def _apply_threshold(self, cls: Classification) -> Classification:
         if (

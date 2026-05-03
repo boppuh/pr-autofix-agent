@@ -33,7 +33,7 @@ _PATCH_SYSTEM = """You generate minimal patches for Cursor Bugbot PR review comm
 Hard rules:
 - Touch ONLY files referenced by the thread or directly required by the fix.
 - Never exceed the file budget.
-- Never modify CI workflows, lockfiles, or .pr-autofix.yml.
+- Never modify CI workflows, lockfiles, or .pr-agent.yml.
 - Output ENTIRE new file contents (not diffs) for each modified file.
 - Do NOT add unrelated cleanup, comments, or refactors.
 - If the comment cannot be safely auto-fixed, return an empty files array.
