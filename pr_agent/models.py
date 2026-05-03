@@ -108,7 +108,7 @@ class TargetRepoConfig(BaseModel):
     validate_: list[ValidateCommand] = Field(default_factory=list, alias="validate")
     exclude_paths: list[str] = Field(default_factory=list)
     max_files_per_patch: int = 5
-    bugbot_logins: list[str] = Field(default_factory=lambda: ["cursor[bot]"])
+    bugbot_logins: list[str] = Field(default_factory=lambda: ["cursor", "cursor[bot]"])
 
     model_config = {"populate_by_name": True}
 
