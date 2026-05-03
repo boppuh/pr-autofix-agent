@@ -1,0 +1,74 @@
+name: PR Autofix Agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: pr-autofix-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event.pull_request.number != null || github.event.issue.pull_request != null
+    steps:
+      - name: Resolve PR head ref
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          data=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          head_ref=$(echo "$data" | jq -r .head.ref)
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Run agent
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GIT_AUTHOR_EMAIL: pr-autofix-agent@users.noreply.github.com
+        run: |
+          python -m pr_agent.run \
+            --repo "${{ github.repository }}" \
+            --pr "${{ steps.pr.outputs.pr_number }}"
+
+      - name: Upload run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-autofix-state-${{ steps.pr.outputs.pr_number }}
+          path: pr_agent_state.json
+          if-no-files-found: ignore
