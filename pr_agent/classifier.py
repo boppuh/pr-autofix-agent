@@ -106,6 +106,8 @@ AUTO_FIX_PATTERNS: list[str] = [
 # Whole-comment anchors so that "LGTM" inside a longer comment doesn't
 # mark the thread as ignorable. Each pattern matches a comment whose entire
 # body is the snippet plus optional trailing punctuation/whitespace.
+# NOTE: compiled WITHOUT re.MULTILINE so that ^ and $ anchor to the start/end
+# of the whole string, not individual lines.
 IGNORE_PATTERNS: list[str] = [
     r"^\s*lgtm[!.\s]*$",
     r"^\s*thanks?(\s+you)?[!.\s]*$",
@@ -118,14 +120,17 @@ IGNORE_PATTERNS: list[str] = [
 ]
 
 
-def _compile(patterns: list[str]) -> list[re.Pattern[str]]:
-    flags = re.IGNORECASE | re.MULTILINE
+def _compile(patterns: list[str], *, multiline: bool = True) -> list[re.Pattern[str]]:
+    flags = re.IGNORECASE
+    if multiline:
+        flags |= re.MULTILINE
     return [re.compile(p, flags) for p in patterns]
 
 
 _NEEDS_HUMAN_RE = _compile(NEEDS_HUMAN_PATTERNS)
 _AUTO_FIX_RE = _compile(AUTO_FIX_PATTERNS)
-_IGNORE_RE = _compile(IGNORE_PATTERNS)
+# IGNORE patterns must NOT use MULTILINE — anchors must match the whole string.
+_IGNORE_RE = _compile(IGNORE_PATTERNS, multiline=False)
 
 
 def _first_match(body: str, regexes: list[re.Pattern[str]]) -> str | None:
