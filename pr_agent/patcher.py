@@ -59,30 +59,79 @@ class UnsafePatchError(Exception):
 # quoted form when a path contains spaces, tabs, control chars, or
 # non-ASCII bytes — see ``core.quotePath``). The wrapping quotes appear
 # *outside* the ``a/`` / ``b/`` prefix.
-_PLAIN_PATH = r"\S+"
+# A "side" of a diff header is either ``a/path`` / ``b/path`` plain, or
+# ``"a/path with space"`` / ``"b/path with space"`` quoted (git emits the
+# quoted form when a path contains spaces, tabs, control chars, or
+# non-ASCII bytes — see ``core.quotePath``). The wrapping quotes appear
+# *outside* the ``a/`` / ``b/`` prefix.
 _DIFF_GIT_RE = re.compile(
-    rf'^diff --git (?:a/({_PLAIN_PATH})|"a/((?:[^"\\]|\\.)*)")'
-    rf' (?:b/({_PLAIN_PATH})|"b/((?:[^"\\]|\\.)*)")$',
-    re.MULTILINE,
+    r'^diff --git (?:a/(\S+)|"a/((?:[^"\\]|\\.)*)")'
+    r' (?:b/(\S+)|"b/((?:[^"\\]|\\.)*)")$'
 )
-_PLUS_FILE_RE = re.compile(
-    rf'^\+\+\+ (?:b/({_PLAIN_PATH})|"b/((?:[^"\\]|\\.)*)")$', re.MULTILINE
-)
+_PLUS_HEADER_RE = re.compile(r'^\+\+\+ (?:b/(\S+)|"b/((?:[^"\\]|\\.)*)")$')
+
+# Standard C-style single-char escapes git emits in quoted paths.
+_QUOTED_SHORT_ESCAPES = {
+    "a": b"\a",
+    "b": b"\b",
+    "f": b"\f",
+    "n": b"\n",
+    "r": b"\r",
+    "t": b"\t",
+    "v": b"\v",
+    "\\": b"\\",
+    '"': b'"',
+}
 
 
 def _decode_quoted_inner(inner: str) -> str:
-    """Decode standard git backslash escapes in a quoted-path body.
+    """Decode the inside of a git quoted-path token to a real path string.
 
-    Handles \\\\, \\", \\n, \\t, and \\<octal> sequences git emits for
-    non-ASCII bytes. Falls back to the raw inner string if decoding
-    fails.
+    Git's quoted form is C-style: backslash-octal sequences encode raw
+    bytes (e.g. ``\\303\\251`` for the UTF-8 bytes of ``é``). Walk the
+    string character by character, accumulating real bytes, then decode
+    the byte buffer as UTF-8. ``unicode_escape`` would interpret
+    ``\\303`` as codepoint U+00C3, producing mojibake for any non-ASCII
+    path — and a path that round-trips to mojibake silently bypasses the
+    ``protected_paths`` check.
     """
+    out = bytearray()
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        # Escape: look at the next character.
+        if i + 1 >= n:
+            out.append(ord("\\"))
+            i += 1
+            continue
+        nxt = inner[i + 1]
+        if nxt in _QUOTED_SHORT_ESCAPES:
+            out.extend(_QUOTED_SHORT_ESCAPES[nxt])
+            i += 2
+            continue
+        # Three-digit octal byte: \NNN
+        if nxt.isdigit() and i + 3 < n + 1:
+            octal = inner[i + 1 : i + 4]
+            if len(octal) == 3 and all(c in "01234567" for c in octal):
+                out.append(int(octal, 8))
+                i += 4
+                continue
+        # Unknown escape — keep both characters literal.
+        out.extend(("\\" + nxt).encode("utf-8"))
+        i += 2
     try:
-        return inner.encode("latin-1", "backslashreplace").decode(
-            "unicode_escape"
-        )
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return inner
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return out.decode("utf-8", errors="replace")
+
+
+def _path_from_match(plain: str, quoted: str) -> str:
+    return plain if plain else _decode_quoted_inner(quoted)
 
 
 def extract_touched_files(diff_text: str) -> list[str]:
@@ -99,6 +148,13 @@ def extract_touched_files(diff_text: str) -> list[str]:
     Handles git's quoted-path form (``"b/path with spaces.py"``) so a
     diff targeting a protected path that git happens to quote can't slip
     past the safety guards.
+
+    Uses a small state machine instead of a global multiline regex: a
+    payload addition line whose content begins with ``++ b/...`` would
+    render in the diff as ``+++ b/...``, indistinguishable from a real
+    file header without context. Only the ``+++`` line that appears in
+    file-header position (between ``diff --git`` and the first ``@@``
+    of that file) is treated as a header.
     """
     paths: list[str] = []
     seen: set[str] = set()
@@ -108,12 +164,24 @@ def extract_touched_files(diff_text: str) -> list[str]:
             paths.append(path)
             seen.add(path)
 
-    for _a_plain, _a_quoted, b_plain, b_quoted in _DIFF_GIT_RE.findall(diff_text):
-        b = b_plain if b_plain else _decode_quoted_inner(b_quoted)
-        _add(b)
-    for b_plain, b_quoted in _PLUS_FILE_RE.findall(diff_text):
-        b = b_plain if b_plain else _decode_quoted_inner(b_quoted)
-        _add(b)
+    # Default to in-header so a diff that lacks a ``diff --git`` line
+    # (e.g. plain ``--- a/x``/``+++ b/x``) still has its ``+++`` row
+    # recognised as a header before any ``@@`` switches to payload mode.
+    in_header = True
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            in_header = True
+            m = _DIFF_GIT_RE.match(line)
+            if m:
+                _add(_path_from_match(m.group(3), m.group(4)))
+            continue
+        if line.startswith("@@"):
+            in_header = False
+            continue
+        if in_header and line.startswith("+++ "):
+            m2 = _PLUS_HEADER_RE.match(line)
+            if m2:
+                _add(_path_from_match(m2.group(1), m2.group(2)))
     return paths
 
 

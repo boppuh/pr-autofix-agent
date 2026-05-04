@@ -331,6 +331,36 @@ def test_count_patch_lines_counts_payload_starting_with_double_dash():
     assert count_patch_lines(diff) == 2
 
 
+def test_extract_touched_files_decodes_octal_non_ascii_paths():
+    """Regression: git emits C-style octal escapes for non-ASCII bytes
+    (\\303\\251 = UTF-8 'é'). unicode_escape interprets \\303 as U+00C3
+    (Ã) producing mojibake; a protected path with non-ASCII chars then
+    bypasses the safety check."""
+    diff = (
+        'diff --git "a/src/caf\\303\\251.py" "b/src/caf\\303\\251.py"\n'
+        '--- "a/src/caf\\303\\251.py"\n'
+        '+++ "b/src/caf\\303\\251.py"\n'
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    assert extract_touched_files(diff) == ["src/café.py"]
+
+
+def test_extract_touched_files_ignores_payload_lines_starting_with_plus_plus_b():
+    """Regression: a hunk payload line whose content starts with '++ b/'
+    renders as '+++ b/...' and was matched by the global regex as a
+    file header. Only +++ at file-header position is a real header."""
+    diff = (
+        "diff --git a/notes.md b/notes.md\n"
+        "--- a/notes.md\n+++ b/notes.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        " existing\n"
+        "+++ b/infra/main.tf\n"  # payload addition, not a header
+    )
+    # Only notes.md is a real header; the +++ b/infra/main.tf line is
+    # inside a hunk and must not appear as a touched path.
+    assert extract_touched_files(diff) == ["notes.md"]
+
+
 def test_extract_touched_files_decodes_quoted_paths():
     """Regression: git quotes paths containing spaces/non-ASCII (core.quotePath).
     The safety layer must see the actual path, not skip the quoted token."""
