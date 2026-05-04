@@ -241,12 +241,19 @@ def validate_diff_response(text: str) -> str:
 
     Raises ``LLMResponseError`` on any violation. Pass-through for the
     ``ESCALATE: <reason>`` form so the caller can recognise it.
+
+    Markdown-fence detection is line-anchored: a wrapping fence (``\\`\\`\\```)
+    appears as the first character of a line. Unified-diff payload lines
+    always start with ``+``, ``-``, or `` `` (context space), so a payload
+    line that *contains* triple backticks (a docstring example, a markdown
+    code fence inside the changed file) doesn't trigger a false positive.
     """
     stripped = text.strip()
     if stripped.startswith("ESCALATE:"):
         return stripped
-    if _FENCE_TOKEN in stripped:
-        raise LLMResponseError("response contained a markdown fence")
+    for line in stripped.splitlines():
+        if line.startswith(_FENCE_TOKEN):
+            raise LLMResponseError("response contained a markdown fence")
     if not _DIFF_HEADER_RE.search(stripped):
         raise LLMResponseError("response is not a unified diff")
     return stripped

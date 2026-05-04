@@ -106,3 +106,31 @@ def test_validate_diff_response_rejects_prose():
 
     with pytest.raises(LLMResponseError, match="not a unified diff"):
         validate_diff_response("Sure, here is the fix: change line 5 to do X.")
+
+
+def test_validate_diff_response_accepts_payload_lines_containing_backticks():
+    """Regression: a valid diff that adds, removes, or has as context any
+    line containing triple backticks (e.g. a markdown README, a Python
+    docstring with code-fence examples) must NOT be rejected as a fence.
+    The fence check is line-anchored — only lines that START with ``` are
+    treated as wrapping fences."""
+    from pr_agent.llm._base import validate_diff_response
+
+    # Payload-line variants: + line containing ```, - line containing ```,
+    # context line ' ```...' (the leading space is the diff context marker).
+    raw = (
+        "diff --git a/README.md b/README.md\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1,4 +1,4 @@\n"
+        " # Title\n"
+        "-```python\n"
+        "+```bash\n"
+        " example\n"
+        " ```\n"
+    )
+    out = validate_diff_response(raw)
+    assert "diff --git" in out
+    # Confirm the test really exercises payload lines containing fences.
+    assert "```python" in out
+    assert "```bash" in out
