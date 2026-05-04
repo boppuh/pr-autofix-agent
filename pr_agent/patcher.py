@@ -54,11 +54,6 @@ class UnsafePatchError(Exception):
 # --- Free functions (Phase 9 spec) ---------------------------------------
 
 
-# A "side" in the header is either ``a/path`` / ``b/path`` plain, or
-# ``"a/path with space"`` / ``"b/path with space"`` quoted (git emits the
-# quoted form when a path contains spaces, tabs, control chars, or
-# non-ASCII bytes — see ``core.quotePath``). The wrapping quotes appear
-# *outside* the ``a/`` / ``b/`` prefix.
 # A "side" of a diff header is either ``a/path`` / ``b/path`` plain, or
 # ``"a/path with space"`` / ``"b/path with space"`` quoted (git emits the
 # quoted form when a path contains spaces, tabs, control chars, or
