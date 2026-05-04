@@ -95,11 +95,16 @@ def count_patch_lines(diff_text: str) -> int:
     count = 0
     in_hunk = False
     for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            # New file: reset the state machine so the next file's
+            # ---/+++ header rows are skipped, not counted as payload.
+            in_hunk = False
+            continue
         if line.startswith("@@"):
             in_hunk = True
             continue
         if not in_hunk:
-            # File-header territory (diff --git, index, ---/+++ paths, etc.)
+            # File-header territory (index, ---/+++ paths, etc.)
             continue
         if line.startswith(("+", "-")):
             count += 1

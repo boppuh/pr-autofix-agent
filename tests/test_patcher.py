@@ -331,6 +331,25 @@ def test_count_patch_lines_counts_payload_starting_with_double_dash():
     assert count_patch_lines(diff) == 2
 
 
+def test_count_patch_lines_resets_in_hunk_between_files():
+    """Regression: in a multi-file diff, the second file's ---/+++ header
+    rows must not be counted as payload. Without resetting ``in_hunk`` on
+    ``diff --git``, those headers (which start with ``-`` and ``+``) inflate
+    the count by 2 per additional file."""
+    diff = (
+        "diff --git a/x b/x\n"
+        "--- a/x\n+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "-old\n+new\n"
+        "diff --git a/y b/y\n"
+        "--- a/y\n+++ b/y\n"
+        "@@ -1 +1 @@\n"
+        "-old\n+new\n"
+    )
+    # 4 payload lines total (2 per file), not 6.
+    assert count_patch_lines(diff) == 4
+
+
 def test_violates_protected_paths_directory_prefix():
     assert violates_protected_paths(["infra/main.tf"], ["infra/"]) is True
     assert violates_protected_paths(["src/foo.py"], ["infra/"]) is False
