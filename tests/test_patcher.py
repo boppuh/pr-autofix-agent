@@ -122,6 +122,26 @@ def test_stage_and_commit_returns_none_on_no_op(git_repo):
     assert head_after == head_before
 
 
+def test_stage_and_commit_returns_none_when_only_untracked_files_present(git_repo):
+    """Regression: a target repo with the agent's own untracked state file
+    on disk must still hit the no-op exit when the patch itself is a no-op.
+
+    Earlier the guard used ``git status --porcelain`` which counts ``??``
+    lines, so an untracked ``.pr-agent-state.json`` made the guard always
+    return True; ``git commit`` then crashed with 'nothing added to commit
+    but untracked files present'. We now check the index directly."""
+    p = _mk(git_repo)
+    head_before = _git(["rev-parse", "HEAD"], cwd=git_repo).strip()
+    # Simulate the agent's own state file landing in the working tree.
+    (git_repo / ".pr-agent-state.json").write_text('{"round": 1}')
+    # No-op patch (same content as on disk).
+    patch = _patch("T1", [("src/foo.py", "def f(x):\n    return x\n")])
+    written = p.apply(patch)
+    sha = p.stage_and_commit(["- noop"], written, author_email="a@b")
+    assert sha is None
+    assert _git(["rev-parse", "HEAD"], cwd=git_repo).strip() == head_before
+
+
 def test_stage_and_commit_message_uses_spec_header(git_repo):
     """Commit message starts with the Phase 12 fixed header; body lists
     every supplied summary line."""

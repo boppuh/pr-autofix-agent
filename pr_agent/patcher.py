@@ -357,8 +357,18 @@ class Patcher:
         return self._git("rev-parse", "HEAD").strip()
 
     def _has_changes_to_commit(self) -> bool:
-        """True if ``git status --porcelain`` reports any lines."""
-        return bool(self._git("status", "--porcelain").strip())
+        """True iff there are staged changes ready for ``git commit``.
+
+        Checks the index directly via ``git diff --cached --name-only``.
+        We deliberately do NOT use ``git status --porcelain`` because that
+        includes untracked files (``??`` lines) by default. The agent
+        writes its own ``.pr-agent-state.json`` to the repo root during the
+        run; target repos won't have it in their ``.gitignore``, so a
+        porcelain check would always report changes (the untracked state
+        file) and the no-op guard would never fire — letting ``git commit``
+        fail with ``nothing added to commit but untracked files present``.
+        """
+        return bool(self._git("diff", "--cached", "--name-only").strip())
 
     def push(self, branch: str) -> None:
         self._git("push", "origin", f"HEAD:{branch}")
