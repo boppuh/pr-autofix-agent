@@ -168,7 +168,10 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as e:
                     log.warning("Could not post all-needs-human comment: %s", e)
                 try:
-                    gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
+                    gh.add_labels(
+                        inputs.pr_number,
+                        [inputs.needs_human_label, "agent:needs-human"],
+                    )
                 except Exception as e:
                     log.warning("Could not apply all-needs-human label: %s", e)
                 state.record_round(round_result)
@@ -626,9 +629,16 @@ def _finish(gh: GitHubClient, pr_number: int, state: AgentState) -> int:
     """Post the run summary, close the GitHub client, and return exit code 0.
 
     Single funnel for every clean exit path in :func:`main` so we can't
-    accidentally drop the summary on one branch.
+    accidentally drop the summary or the ``agent:autofixed`` label on one
+    branch. The label is applied once if at least one round produced a
+    commit; additive — never removed, coexists with escalation labels.
     """
     _post_run_summary(gh, pr_number, state.report)
+    if any(r.commit_sha for r in state.report.rounds):
+        try:
+            gh.add_labels(pr_number, ["agent:autofixed"])
+        except Exception as e:
+            log.warning("Could not apply agent:autofixed label: %s", e)
     gh.close()
     return 0
 
@@ -691,7 +701,15 @@ def _escalate(
     unresolved: list[str],
 ) -> None:
     state.escalate(reason, unresolved)
-    labels = [inputs.needs_human_label, *_REASON_LABEL_MAP.get(reason, [])]
+    # Phase 14: every human-needed escalation also carries the fixed
+    # `agent:needs-human` label alongside the configurable
+    # ``inputs.needs_human_label`` (defaults to ``needs-human``). GitHub
+    # add_labels is additive so duplicates collapse.
+    labels = [
+        inputs.needs_human_label,
+        "agent:needs-human",
+        *_REASON_LABEL_MAP.get(reason, []),
+    ]
     try:
         gh.add_labels(inputs.pr_number, labels)
         gh.create_pr_comment(
