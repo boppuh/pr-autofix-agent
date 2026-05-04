@@ -6,8 +6,10 @@ import pytest
 
 from pr_agent.models import Patch, PatchFile
 from pr_agent.patcher import (
+    FileSection,
     Patcher,
     UnsafePatchError,
+    _iter_diff_sections,
     apply_unified_diff,
     count_patch_lines,
     extract_touched_files,
@@ -407,6 +409,57 @@ def test_count_patch_lines_resets_in_hunk_between_files():
     )
     # 4 payload lines total (2 per file), not 6.
     assert count_patch_lines(diff) == 4
+
+
+def test_iter_diff_sections_splits_per_file():
+    diff = (
+        "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+        "diff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -1,2 +1,2 @@\n-c\n-d\n+e\n+f\n"
+    )
+    sections = _iter_diff_sections(diff)
+    assert len(sections) == 2
+    assert sections[0] == FileSection(
+        a_paths=("x",), b_paths=("x",), payload_lines=2
+    )
+    assert sections[1] == FileSection(
+        a_paths=("y",), b_paths=("y",), payload_lines=4
+    )
+
+
+def test_iter_diff_sections_handles_no_diff_git_line():
+    diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    sections = _iter_diff_sections(diff)
+    assert len(sections) == 1
+    assert sections[0].a_paths == ("x",)
+    assert sections[0].b_paths == ("x",)
+    assert sections[0].payload_lines == 2
+
+
+def test_iter_diff_sections_payload_starting_with_dashes_counted():
+    """A removed line whose content begins with '-- ' renders as
+    '--- <content>' in the diff. The walker uses position, not regex,
+    to distinguish header from payload, so this is correctly counted."""
+    diff = (
+        "diff --git a/x b/x\n"
+        "--- a/x\n+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "---some-arg\n"
+        "+++some-arg\n"
+    )
+    sections = _iter_diff_sections(diff)
+    assert sections[0].payload_lines == 2
+
+
+def test_iter_diff_sections_rename_yields_distinct_sides():
+    diff = (
+        "diff --git a/secrets/key.py b/src/utils.py\n"
+        "similarity index 100%\n"
+        "rename from secrets/key.py\nrename to src/utils.py\n"
+    )
+    sections = _iter_diff_sections(diff)
+    assert sections[0].a_paths == ("secrets/key.py",)
+    assert sections[0].b_paths == ("src/utils.py",)
+    assert sections[0].payload_lines == 0
 
 
 def test_violates_protected_paths_directory_prefix():
