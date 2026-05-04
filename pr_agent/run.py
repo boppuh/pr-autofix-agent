@@ -321,10 +321,16 @@ def main(argv: list[str] | None = None) -> int:
 
             # The patch is reverted at this point, so EVERY Bugbot thread on
             # the PR is still unresolved — not just the live_fixable subset.
-            # Report the full set so the escalation comment / state file
-            # match reality (consistent with NO_PROGRESS, MAX_ROUNDS, and
-            # RUNTIME_BUDGET_EXHAUSTED).
-            unresolved_ids = [t.id for t in threads]
+            # Re-fetch from the API rather than reusing local ``threads``,
+            # which may have been capped to ``max_comments_per_round``.
+            # Consistent with NO_PROGRESS, MAX_ROUNDS, and
+            # RUNTIME_BUDGET_EXHAUSTED escalation paths.
+            unresolved_ids = [
+                t.id
+                for t in gh.get_unresolved_bugbot_threads(
+                    inputs.pr_number, repo_cfg.bugbot_logins
+                )
+            ]
 
             if safety.exit_on_validation_failure:
                 # Phase 10 default: post a PR comment summarising the failed
