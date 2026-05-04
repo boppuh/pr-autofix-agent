@@ -173,8 +173,10 @@ def apply_unified_diff(
         # Post-apply: git diff --check catches whitespace errors and merge-
         # conflict markers (<<<<<<<, =======, >>>>>>>) that --check at the
         # patch level can't see because they're valid diff hunks.
+        # Scope to only the files touched by this patch to avoid spurious
+        # failures from pre-existing uncommitted changes in other files.
         try:
-            _run_git(["diff", "--check"], cwd=repo_root)
+            _run_git(["diff", "--check", "--"] + files, cwd=repo_root)
         except RuntimeError as e:
             log.info("apply_unified_diff: git diff --check failed; reverting: %s", e)
             try:
