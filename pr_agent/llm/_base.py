@@ -131,8 +131,9 @@ def format_patch_user(
         parts += ["", "PR description:", pr_body_excerpt]
     if pr_diff_excerpt:
         parts += ["", "PR diff (truncated):", "```diff", pr_diff_excerpt, "```"]
+    if parts:
+        parts.append("")
     parts += [
-        "",
         f"Thread path: {thread.path or '(none)'}",
         f"Thread line: {thread.line if thread.line is not None else '(none)'}",
         f"File budget: at most {max_files} file(s).",
