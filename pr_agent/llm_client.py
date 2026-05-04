@@ -60,10 +60,10 @@ class LLMClient:
             user=user,
             max_tokens=400,
         )
-        data = _extract_json(text)
         try:
+            data = _extract_json(text)
             return Classification.model_validate(data)
-        except ValidationError as e:
+        except (LLMResponseError, ValidationError) as e:
             log.warning("Classifier returned invalid JSON: %s; raw=%r", e, text[:300])
             return Classification(
                 label=ClassificationLabel.HUMAN_REQUIRED,
