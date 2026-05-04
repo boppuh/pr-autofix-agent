@@ -353,8 +353,25 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             continue
 
-        author_email = os.environ.get("GIT_AUTHOR_EMAIL", "pr-autofix-agent@users.noreply.github.com")
-        sha = patcher.stage_and_commit(patches[0][1], applied_paths, author_email)
+        author_email = os.environ.get(
+            "GIT_AUTHOR_EMAIL", "pr-autofix-agent[bot]@users.noreply.github.com"
+        )
+        # Aggregate one summary line per thread across the entire round so
+        # the commit body covers every fix, not just patches[0].
+        summary_lines = [
+            f"- thread {thread.id}: {patch.summary}"
+            for thread, patch in patches
+        ]
+        sha = patcher.stage_and_commit(summary_lines, applied_paths, author_email)
+        if sha is None:
+            log.info(
+                "Round %d: nothing to commit (patch was a no-op vs. working tree); "
+                "skipping push and thread replies.",
+                round_no,
+            )
+            state.record_round(round_result)
+            last_failure = None
+            continue
         patcher.push(head_ref)
         round_result.commit_sha = sha
         round_result.fixed_thread_ids = [t.id for t, _ in patches]

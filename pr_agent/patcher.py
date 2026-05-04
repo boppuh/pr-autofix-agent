@@ -323,18 +323,42 @@ class Patcher:
         log.info("Applied patch %s: %d files", patch.thread_id, len(written))
         return written
 
-    def stage_and_commit(self, patch: Patch, paths: list[Path], author_email: str) -> str:
+    def stage_and_commit(
+        self,
+        summary_lines: list[str],
+        paths: list[Path],
+        author_email: str,
+    ) -> str | None:
+        """Stage paths and commit if there's anything to commit.
+
+        Returns the new commit sha, or ``None`` when ``git status --porcelain``
+        is empty after staging (the patch was a no-op against current content).
+        Callers treat ``None`` as "commit was skipped, don't push or reply".
+
+        ``summary_lines`` becomes the commit body (one bullet per thread,
+        already formatted by the caller). The header is fixed per the
+        Phase 12 spec: ``fix: address Cursor Bugbot comments``.
+        """
         rel = [str(p.relative_to(self._root)) for p in paths]
         self._git("add", "--", *rel)
-        msg = f"fix(autofix): {patch.summary} [thread {patch.thread_id}]"
+        if not self._has_changes_to_commit():
+            log.info("stage_and_commit: nothing to commit (working tree clean).")
+            return None
+        header = "fix: address Cursor Bugbot comments"
+        body = "\n".join(summary_lines)
+        msg = f"{header}\n\n{body}" if body else header
         env_args = [
             "-c",
             f"user.email={author_email}",
             "-c",
-            "user.name=pr-autofix-agent",
+            "user.name=pr-autofix-agent[bot]",
         ]
         self._git(*env_args, "commit", "-m", msg)
         return self._git("rev-parse", "HEAD").strip()
+
+    def _has_changes_to_commit(self) -> bool:
+        """True if ``git status --porcelain`` reports any lines."""
+        return bool(self._git("status", "--porcelain").strip())
 
     def push(self, branch: str) -> None:
         self._git("push", "origin", f"HEAD:{branch}")

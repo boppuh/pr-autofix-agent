@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from pr_agent.models import Patch, PatchFile
@@ -89,12 +91,71 @@ def test_revert_restores_committed_content(git_repo):
     assert "return x" in (git_repo / "src/foo.py").read_text()
 
 
+def _git(args: list[str], cwd) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
+    ).stdout
+
+
 def test_stage_and_commit_returns_sha(git_repo):
     p = _mk(git_repo)
     patch = _patch("T1", [("src/foo.py", "def f(x):\n    return x or 0\n")])
     written = p.apply(patch)
-    sha = p.stage_and_commit(patch, written, author_email="a@b")
+    sha = p.stage_and_commit(["- thread T1: fix"], written, author_email="a@b")
+    assert sha is not None
     assert len(sha) >= 7
+
+
+def test_stage_and_commit_returns_none_on_no_op(git_repo):
+    """Re-staging a file with the SAME content as on-disk produces no diff;
+    stage_and_commit must return None and leave HEAD unchanged."""
+    p = _mk(git_repo)
+    head_before = _git(["rev-parse", "HEAD"], cwd=git_repo).strip()
+    # The file already contains "def f(x):\n    return x\n" from the fixture.
+    # Apply a patch that writes the SAME content back — the working tree
+    # is unchanged after apply, so `git status --porcelain` is empty.
+    patch = _patch("T1", [("src/foo.py", "def f(x):\n    return x\n")])
+    written = p.apply(patch)
+    sha = p.stage_and_commit(["- noop"], written, author_email="a@b")
+    assert sha is None
+    head_after = _git(["rev-parse", "HEAD"], cwd=git_repo).strip()
+    assert head_after == head_before
+
+
+def test_stage_and_commit_message_uses_spec_header(git_repo):
+    """Commit message starts with the Phase 12 fixed header; body lists
+    every supplied summary line."""
+    p = _mk(git_repo)
+    patch = _patch(
+        "T1",
+        [("src/foo.py", "def f(x):\n    return x or 0\n")],
+    )
+    written = p.apply(patch)
+    sha = p.stage_and_commit(
+        [
+            "- thread T1: missing null check",
+            "- thread T2: removed unused import",
+        ],
+        written,
+        author_email="a@b",
+    )
+    assert sha is not None
+    msg = _git(["log", "-1", "--pretty=%B"], cwd=git_repo)
+    assert msg.startswith("fix: address Cursor Bugbot comments")
+    assert "thread T1: missing null check" in msg
+    assert "thread T2: removed unused import" in msg
+
+
+def test_stage_and_commit_uses_bot_identity(git_repo):
+    """Commit's author name is the spec's bot identity, with the [bot] suffix."""
+    p = _mk(git_repo)
+    patch = _patch("T1", [("src/foo.py", "def f(x):\n    return x or 0\n")])
+    written = p.apply(patch)
+    p.stage_and_commit(["- foo"], written, author_email="bot@example.com")
+    name = _git(["log", "-1", "--pretty=%an"], cwd=git_repo).strip()
+    email = _git(["log", "-1", "--pretty=%ae"], cwd=git_repo).strip()
+    assert name == "pr-autofix-agent[bot]"
+    assert email == "bot@example.com"
 
 
 # --- apply_diff (Phase 8 batched path) ----------------------------------
