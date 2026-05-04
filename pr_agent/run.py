@@ -285,6 +285,13 @@ def main(argv: list[str] | None = None) -> int:
             last_failure = failure_text
             patcher.revert_uncommitted(applied_paths)
 
+            # The patch is reverted at this point, so EVERY Bugbot thread on
+            # the PR is still unresolved — not just the live_fixable subset.
+            # Report the full set so the escalation comment / state file
+            # match reality (consistent with NO_PROGRESS, MAX_ROUNDS, and
+            # RUNTIME_BUDGET_EXHAUSTED).
+            unresolved_ids = [t.id for t in threads]
+
             if safety.exit_on_validation_failure:
                 # Phase 10 default: post a PR comment summarising the failed
                 # command, apply the agent:failed-validation label, and exit.
@@ -297,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
                     inputs,
                     state,
                     EscalationReason.VALIDATION_FAILED,
-                    [t.id for t in live_fixable],
+                    unresolved_ids,
                 )
                 gh.close()
                 return 0
@@ -314,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
                     inputs,
                     state,
                     EscalationReason.REPEATED_VALIDATION_FAILURE,
-                    [t.id for t in live_fixable],
+                    unresolved_ids,
                 )
                 return 0
             continue

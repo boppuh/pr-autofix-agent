@@ -37,12 +37,25 @@ def run_validation(
     any command returned a non-zero exit code or timed out.
     """
     cwd = repo_root or Path.cwd()
+    # Each plain string is its own name (used in CommandResult.name and the
+    # log messages). Validator class wraps named commands; both call into
+    # _run_specs so the loop logic lives in exactly one place.
+    return _run_specs([(c, c) for c in commands], cwd=cwd)
+
+
+def _run_specs(specs: list[tuple[str, str]], *, cwd: Path) -> ValidationResult:
+    """Shared loop: run each ``(name, command)`` spec until one fails.
+
+    Single source of truth for the validation control flow. Both
+    :func:`run_validation` and :meth:`Validator.run` delegate here so
+    behaviour stays in lock-step.
+    """
     results: list[CommandResult] = []
-    for cmd in commands:
-        result = _run_one(name=cmd, command=cmd, cwd=cwd)
+    for name, command in specs:
+        result = _run_one(name=name, command=command, cwd=cwd)
         results.append(result)
         if not result.ok:
-            log.warning("Validator %s failed (exit %d)", cmd, result.exit_code)
+            log.warning("Validator %s failed (exit %d)", name, result.exit_code)
             break
     success = all(r.ok for r in results)
     return ValidationResult(success=success, command_results=results)
@@ -91,15 +104,10 @@ class Validator:
         self._commands = commands
 
     def run(self) -> ValidationResult:
-        results: list[CommandResult] = []
-        for cmd in self._commands:
-            result = _run_one(name=cmd.name, command=cmd.run, cwd=self._root)
-            results.append(result)
-            if not result.ok:
-                log.warning("Validator %s failed (exit %d)", cmd.name, result.exit_code)
-                break
-        success = all(r.ok for r in results)
-        return ValidationResult(success=success, command_results=results)
+        return _run_specs(
+            [(cmd.name, cmd.run) for cmd in self._commands],
+            cwd=self._root,
+        )
 
     @staticmethod
     def format_failure(result: ValidationResult) -> str:
