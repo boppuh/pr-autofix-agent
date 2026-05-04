@@ -1,22 +1,26 @@
+"""Provider-agnostic base: shared prompts, JSON parsing, and the Protocol."""
+
 from __future__ import annotations
 
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
-from anthropic import Anthropic
 from pydantic import ValidationError
 
-from .models import Classification, ClassificationLabel, Patch, PatchFile, ReviewThread
+from ..models import (
+    Classification,
+    ClassificationLabel,
+    Patch,
+    PatchFile,
+    ReviewThread,
+)
 
 log = logging.getLogger(__name__)
 
 
-class LLMResponseError(Exception):
-    """LLM returned text that did not decode to a JSON object."""
-
-_CLASSIFY_SYSTEM = """You triage Cursor Bugbot PR review comments.
+CLASSIFY_SYSTEM = """You triage Cursor Bugbot PR review comments.
 
 Decide whether a comment is AUTO-FIXABLE (small, mechanical, scoped) or HUMAN-REQUIRED
 (architectural, ambiguous, multi-file design discussion, contract change, security policy).
@@ -32,7 +36,7 @@ Output strictly valid JSON: {"label": "auto_fixable"|"human_required",
 "confidence": 0.0-1.0, "reason": "<one sentence>"}.
 """
 
-_PATCH_SYSTEM = """You generate minimal patches for Cursor Bugbot PR review comments.
+PATCH_SYSTEM = """You generate minimal patches for Cursor Bugbot PR review comments.
 
 Hard rules:
 - Touch ONLY files referenced by the thread or directly required by the fix.
@@ -48,28 +52,14 @@ Output strictly valid JSON:
 """
 
 
-class LLMClient:
-    def __init__(self, model: str, api_key: str | None = None):
-        self._client = Anthropic(api_key=api_key) if api_key else Anthropic()
-        self._model = model
+class LLMResponseError(Exception):
+    """Raised when the provider returns text that doesn't decode to JSON."""
 
-    def classify(self, thread: ReviewThread, file_excerpt: str | None) -> Classification:
-        user = _format_classify_user(thread, file_excerpt)
-        text = self._call(
-            system=_CLASSIFY_SYSTEM,
-            user=user,
-            max_tokens=400,
-        )
-        try:
-            data = _extract_json(text)
-            return Classification.model_validate(data)
-        except (LLMResponseError, ValidationError) as e:
-            log.warning("Classifier returned invalid JSON: %s; raw=%r", e, text[:300])
-            return Classification(
-                label=ClassificationLabel.HUMAN_REQUIRED,
-                confidence=0.0,
-                reason="classifier output failed validation",
-            )
+@runtime_checkable
+class LLMProvider(Protocol):
+    """Every concrete provider exposes the same triage/patch surface."""
+
+    def classify(self, thread: ReviewThread, file_excerpt: str | None) -> Classification: ...
 
     def propose_patch(
         self,
@@ -80,49 +70,37 @@ class LLMClient:
         pr_title: str | None = None,
         pr_body_excerpt: str | None = None,
         pr_diff_excerpt: str | None = None,
-    ) -> Patch:
-        user = _format_patch_user(
-            thread,
-            file_contents,
-            max_files,
-            prior_failure,
-            pr_title=pr_title,
-            pr_body_excerpt=pr_body_excerpt,
-            pr_diff_excerpt=pr_diff_excerpt,
-        )
-        # Patches must include full file contents, so give the model headroom.
-        # 4000 was hitting truncation on real-sized source files.
-        text = self._call(system=_PATCH_SYSTEM, user=user, max_tokens=16000)
-        data = _extract_json(text)
-        files_raw = data.get("files") or []
-        files = [PatchFile.model_validate(f) for f in files_raw]
-        return Patch(
-            thread_id=thread.id,
-            files=files,
-            summary=data.get("summary", "autofix"),
-        )
-
-    def _call(self, *, system: str, user: str, max_tokens: int) -> str:
-        resp = self._client.messages.create(
-            model=self._model,
-            max_tokens=max_tokens,
-            system=[
-                {
-                    "type": "text",
-                    "text": system,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user}],
-        )
-        parts: list[str] = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                parts.append(getattr(block, "text", ""))
-        return "".join(parts).strip()
+    ) -> Patch: ...
 
 
-def _format_classify_user(thread: ReviewThread, file_excerpt: str | None) -> str:
+# --- Shared helpers reused by every concrete provider ---------------------
+
+
+def parse_classification(raw_text: str) -> Classification:
+    try:
+        data = extract_json(raw_text)
+        return Classification.model_validate(data)
+    except (LLMResponseError, ValidationError) as e:
+        log.warning("Classifier returned invalid JSON: %s; raw=%r", e, raw_text[:300])
+        return Classification(
+            label=ClassificationLabel.HUMAN_REQUIRED,
+            confidence=0.0,
+            reason="classifier output failed validation",
+        )
+
+
+def parse_patch(raw_text: str, thread_id: str) -> Patch:
+    data = extract_json(raw_text)
+    files_raw = data.get("files") or []
+    files = [PatchFile.model_validate(f) for f in files_raw]
+    return Patch(
+        thread_id=thread_id,
+        files=files,
+        summary=data.get("summary", "autofix"),
+    )
+
+
+def format_classify_user(thread: ReviewThread, file_excerpt: str | None) -> str:
     lines = [
         f"Path: {thread.path or '(none)'}",
         f"Line: {thread.line if thread.line is not None else '(none)'}",
@@ -135,7 +113,7 @@ def _format_classify_user(thread: ReviewThread, file_excerpt: str | None) -> str
     return "\n".join(lines)
 
 
-def _format_patch_user(
+def format_patch_user(
     thread: ReviewThread,
     file_contents: dict[str, str],
     max_files: int,
@@ -151,13 +129,7 @@ def _format_patch_user(
     if pr_body_excerpt:
         parts += ["", "PR description:", pr_body_excerpt]
     if pr_diff_excerpt:
-        parts += [
-            "",
-            "PR diff (truncated):",
-            "```diff",
-            pr_diff_excerpt,
-            "```",
-        ]
+        parts += ["", "PR diff (truncated):", "```diff", pr_diff_excerpt, "```"]
     if parts:
         parts.append("")  # blank line separator only when prior context exists
     parts += [
@@ -169,7 +141,13 @@ def _format_patch_user(
         thread.body_text,
     ]
     if thread.comments and thread.comments[0].diff_hunk:
-        parts += ["", "Diff hunk for the thread:", "```diff", thread.comments[0].diff_hunk, "```"]
+        parts += [
+            "",
+            "Diff hunk for the thread:",
+            "```diff",
+            thread.comments[0].diff_hunk,
+            "```",
+        ]
     if prior_failure:
         parts += [
             "",
@@ -187,7 +165,7 @@ def _format_patch_user(
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
-def _extract_json(text: str) -> dict[str, Any]:
+def extract_json(text: str) -> dict[str, Any]:
     candidates = _FENCE_RE.findall(text) or [text]
     for c in candidates:
         c = c.strip()

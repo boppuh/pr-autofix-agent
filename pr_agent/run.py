@@ -9,7 +9,8 @@ from pathlib import Path
 from .classifier import Classifier
 from .config import ConfigError, load_target_repo_config, load_workflow_inputs, require_env
 from .github_client import GitHubClient
-from .llm_client import LLMClient, LLMResponseError
+from .llm import LLMResponseError, make_provider
+from .llm._factory import default_model_for, env_var_for
 from .models import (
     EscalationReason,
     Patch,
@@ -40,7 +41,9 @@ def main(argv: list[str] | None = None) -> int:
     state = AgentState(inputs.pr_number, persist_path=state_path)
 
     gh_token = require_env("GITHUB_TOKEN")
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    provider_env = env_var_for(inputs.provider)
+    llm_key = os.environ.get(provider_env)
+    model = inputs.model or default_model_for(inputs.provider)
 
     safety = repo_cfg.safety
     max_rounds = min(inputs.max_rounds, safety.max_rounds)
@@ -49,16 +52,18 @@ def main(argv: list[str] | None = None) -> int:
     gh = GitHubClient.from_full_name(gh_token, inputs.repo_full_name)
 
     # Short-circuit before constructing any LLM-dependent component, so the
-    # Anthropic SDK is never instantiated without a key (defense in depth:
-    # current SDK versions defer key validation to first request, but future
-    # versions may raise at construction).
-    if not anthropic_key:
+    # provider SDK is never instantiated without a key (defense in depth:
+    # current SDKs defer key validation to first request, but future versions
+    # may raise at construction).
+    if not llm_key:
         threads = gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)
         if threads:
             log.warning(
-                "ANTHROPIC_API_KEY is not set; cannot triage %d Bugbot thread(s). "
+                "%s is not set; cannot triage %d Bugbot thread(s) with provider=%s. "
                 "Escalating without LLM calls.",
+                provider_env,
                 len(threads),
+                inputs.provider,
             )
             _escalate(
                 gh,
@@ -68,11 +73,14 @@ def main(argv: list[str] | None = None) -> int:
                 [t.id for t in threads],
             )
         else:
-            log.info("ANTHROPIC_API_KEY is not set, but no Bugbot threads to triage. Done.")
+            log.info(
+                "%s is not set, but no Bugbot threads to triage. Done.", provider_env
+            )
         gh.close()
         return 0
 
-    llm = LLMClient(model=inputs.model, api_key=anthropic_key)
+    log.info("Using LLM provider=%s model=%s", inputs.provider, model)
+    llm = make_provider(inputs.provider, model=model, api_key=llm_key)
     classifier = Classifier(
         llm=llm,
         protected_paths=repo_cfg.protected_paths,

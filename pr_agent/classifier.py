@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 
 from ._paths import matches_any_protected
-from .llm_client import LLMClient
+from .llm import LLMProvider
 from .models import Classification, ClassificationLabel, ReviewThread
 
 log = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ class TriageOutcome:
 class Classifier:
     def __init__(
         self,
-        llm: LLMClient,
+        llm: LLMProvider,
         protected_paths: list[str],
         confidence_threshold: float = 0.7,
     ):
