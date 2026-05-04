@@ -102,7 +102,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           NEEDS_HUMAN_LABEL: ${{ inputs.needs_human_label }}
           CONFIDENCE_THRESHOLD: ${{ inputs.confidence_threshold }}
-          GIT_AUTHOR_EMAIL: pr-autofix-agent@users.noreply.github.com
+          GIT_AUTHOR_EMAIL: pr-autofix-agent[bot]@users.noreply.github.com
         run: python -m pr_agent.run
 
       - name: Upload run report
