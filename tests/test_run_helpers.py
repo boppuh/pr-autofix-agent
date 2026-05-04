@@ -170,3 +170,96 @@ def test_format_run_summary_includes_escalation_footer():
     report.final_unresolved_thread_ids = ["T1", "T2", "T3"]
     out = _format_run_summary(report)
     assert "Final status: escalated (`max_rounds`) — 3 unresolved thread(s)." in out
+
+
+# --- _finish + _escalate label tests (Phase 14) ------------------------
+
+
+def _state_with_committed_round():
+    from pr_agent.state import AgentState
+
+    s = AgentState(pr_number=42)
+    s.record_round(RoundResult(round_no=1, commit_sha="abc1234"))
+    return s
+
+
+def _state_with_no_commits():
+    from pr_agent.state import AgentState
+
+    s = AgentState(pr_number=42)
+    s.record_round(RoundResult(round_no=1))  # no commit_sha
+    return s
+
+
+def test_finish_applies_agent_autofixed_when_a_round_committed():
+    from unittest.mock import MagicMock
+
+    from pr_agent.run import _finish
+
+    gh = MagicMock()
+    state = _state_with_committed_round()
+    rc = _finish(gh, pr_number=42, state=state)
+    assert rc == 0
+    label_calls = [c for c in gh.add_labels.call_args_list if "agent:autofixed" in c.args[1]]
+    assert len(label_calls) == 1
+    gh.close.assert_called_once()
+
+
+def test_finish_does_not_apply_agent_autofixed_when_no_commits():
+    from unittest.mock import MagicMock
+
+    from pr_agent.run import _finish
+
+    gh = MagicMock()
+    state = _state_with_no_commits()
+    _finish(gh, pr_number=42, state=state)
+    # No agent:autofixed call.
+    for call in gh.add_labels.call_args_list:
+        assert "agent:autofixed" not in call.args[1], call
+
+
+def test_finish_always_closes_and_posts_summary_even_without_commits():
+    from unittest.mock import MagicMock
+
+    from pr_agent.run import _finish
+
+    gh = MagicMock()
+    state = _state_with_no_commits()
+    _finish(gh, pr_number=42, state=state)
+    gh.close.assert_called_once()
+    # Summary is posted because there's a recorded round.
+    gh.create_pr_comment.assert_called()
+
+
+def test_escalate_includes_agent_needs_human():
+    from unittest.mock import MagicMock
+
+    from pr_agent.models import WorkflowInputs
+    from pr_agent.run import _escalate
+    from pr_agent.state import AgentState
+
+    gh = MagicMock()
+    inputs = WorkflowInputs(pr_number=42, repo_full_name="o/r")  # default needs-human
+    state = AgentState(pr_number=42)
+    _escalate(gh, inputs, state, EscalationReason.NO_PROGRESS, ["T1"])
+    gh.add_labels.assert_called_once()
+    labels = gh.add_labels.call_args.args[1]
+    assert "needs-human" in labels  # configurable default
+    assert "agent:needs-human" in labels  # spec-fixed addition
+
+
+def test_escalate_max_rounds_includes_both_human_and_max_rounds_labels():
+    from unittest.mock import MagicMock
+
+    from pr_agent.models import WorkflowInputs
+    from pr_agent.run import _escalate
+    from pr_agent.state import AgentState
+
+    gh = MagicMock()
+    inputs = WorkflowInputs(pr_number=42, repo_full_name="o/r")
+    state = AgentState(pr_number=42)
+    _escalate(gh, inputs, state, EscalationReason.MAX_ROUNDS, ["T1"])
+    labels = gh.add_labels.call_args.args[1]
+    assert "needs-human" in labels
+    assert "agent:needs-human" in labels
+    assert "agent:max-rounds" in labels
