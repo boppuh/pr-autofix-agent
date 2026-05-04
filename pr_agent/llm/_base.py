@@ -96,6 +96,7 @@ class LLMProvider(Protocol):
         comments: list[ReviewThread],
         repo_context: str,
         validation_commands: list[str],
+        prior_failure: str | None = None,
     ) -> str:
         """Phase 8 batched entry point.
 
@@ -199,6 +200,7 @@ def format_generate_patch_user(
     comments: list[ReviewThread],
     repo_context: str,
     validation_commands: list[str],
+    prior_failure: str | None = None,
 ) -> str:
     """Render the Phase 8 batched user message.
 
@@ -210,11 +212,18 @@ def format_generate_patch_user(
     rendered_validators = (
         "\n".join(f"  - {cmd}" for cmd in validation_commands) if validation_commands else "  (none)"
     )
+    prior_failure_block = (
+        f"Validation failure from a previous attempt (do not repeat it):\n"
+        f"```\n{prior_failure[-2000:]}\n```\n\n"
+        if prior_failure
+        else ""
+    )
     return (
         f"PR title:\n{pr_title}\n\n"
         f"PR body:\n{pr_body or '(none)'}\n\n"
         f"Current PR diff:\n```diff\n{pr_diff}\n```\n\n"
         f"Repo context:\n{repo_context}\n\n"
+        f"{prior_failure_block}"
         f"Unresolved Bugbot comments:\n{rendered_comments}\n\n"
         f"Validation commands:\n{rendered_validators}\n"
     )

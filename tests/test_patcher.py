@@ -331,6 +331,18 @@ def test_count_patch_lines_counts_payload_starting_with_double_dash():
     assert count_patch_lines(diff) == 2
 
 
+def test_extract_touched_files_decodes_quoted_paths():
+    """Regression: git quotes paths containing spaces/non-ASCII (core.quotePath).
+    The safety layer must see the actual path, not skip the quoted token."""
+    diff = (
+        'diff --git "a/src/my file.py" "b/src/my file.py"\n'
+        '--- "a/src/my file.py"\n'
+        '+++ "b/src/my file.py"\n'
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    assert extract_touched_files(diff) == ["src/my file.py"]
+
+
 def test_count_patch_lines_resets_in_hunk_between_files():
     """Regression: in a multi-file diff, the second file's ---/+++ header
     rows must not be counted as payload. Without resetting ``in_hunk`` on

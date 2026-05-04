@@ -210,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 comments=live_fixable,
                 repo_context=repo_context,
                 validation_commands=[c.run for c in repo_cfg.validate_],
+                prior_failure=last_failure,
             )
         except LLMResponseError as e:
             log.info("Batch generate_patch rejected (%s); falling back to per-thread.", e)

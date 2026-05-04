@@ -70,6 +70,7 @@ class AnthropicProvider:
         comments: list[ReviewThread],
         repo_context: str,
         validation_commands: list[str],
+        prior_failure: str | None = None,
     ) -> str:
         user = format_generate_patch_user(
             pr_title=pr_title,
@@ -78,6 +79,7 @@ class AnthropicProvider:
             comments=comments,
             repo_context=repo_context,
             validation_commands=validation_commands,
+            prior_failure=prior_failure,
         )
         text = self._call(system=GENERATE_PATCH_SYSTEM, user=user, max_tokens=16000)
         return validate_diff_response(text)

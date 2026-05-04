@@ -54,8 +54,35 @@ class UnsafePatchError(Exception):
 # --- Free functions (Phase 9 spec) ---------------------------------------
 
 
-_DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
-_PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(\S+)$", re.MULTILINE)
+# A "side" in the header is either ``a/path`` / ``b/path`` plain, or
+# ``"a/path with space"`` / ``"b/path with space"`` quoted (git emits the
+# quoted form when a path contains spaces, tabs, control chars, or
+# non-ASCII bytes — see ``core.quotePath``). The wrapping quotes appear
+# *outside* the ``a/`` / ``b/`` prefix.
+_PLAIN_PATH = r"\S+"
+_DIFF_GIT_RE = re.compile(
+    rf'^diff --git (?:a/({_PLAIN_PATH})|"a/((?:[^"\\]|\\.)*)")'
+    rf' (?:b/({_PLAIN_PATH})|"b/((?:[^"\\]|\\.)*)")$',
+    re.MULTILINE,
+)
+_PLUS_FILE_RE = re.compile(
+    rf'^\+\+\+ (?:b/({_PLAIN_PATH})|"b/((?:[^"\\]|\\.)*)")$', re.MULTILINE
+)
+
+
+def _decode_quoted_inner(inner: str) -> str:
+    """Decode standard git backslash escapes in a quoted-path body.
+
+    Handles \\\\, \\", \\n, \\t, and \\<octal> sequences git emits for
+    non-ASCII bytes. Falls back to the raw inner string if decoding
+    fails.
+    """
+    try:
+        return inner.encode("latin-1", "backslashreplace").decode(
+            "unicode_escape"
+        )
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return inner
 
 
 def extract_touched_files(diff_text: str) -> list[str]:
@@ -68,17 +95,25 @@ def extract_touched_files(diff_text: str) -> list[str]:
     b/safe.py`` but ``+++ b/.github/workflows/ci.yml``) would otherwise
     pass safety checks against ``safe.py`` while ``git apply`` mutates
     the workflow file. Validating the union closes that gap.
+
+    Handles git's quoted-path form (``"b/path with spaces.py"``) so a
+    diff targeting a protected path that git happens to quote can't slip
+    past the safety guards.
     """
     paths: list[str] = []
     seen: set[str] = set()
-    for _, b in _DIFF_GIT_RE.findall(diff_text):
-        if b and b != "/dev/null" and b not in seen:
-            paths.append(b)
-            seen.add(b)
-    for b in _PLUS_FILE_RE.findall(diff_text):
-        if b and b != "/dev/null" and b not in seen:
-            paths.append(b)
-            seen.add(b)
+
+    def _add(path: str) -> None:
+        if path and path != "/dev/null" and path not in seen:
+            paths.append(path)
+            seen.add(path)
+
+    for _a_plain, _a_quoted, b_plain, b_quoted in _DIFF_GIT_RE.findall(diff_text):
+        b = b_plain if b_plain else _decode_quoted_inner(b_quoted)
+        _add(b)
+    for b_plain, b_quoted in _PLUS_FILE_RE.findall(diff_text):
+        b = b_plain if b_plain else _decode_quoted_inner(b_quoted)
+        _add(b)
     return paths
 
 
