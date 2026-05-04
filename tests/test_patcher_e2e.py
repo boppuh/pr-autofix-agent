@@ -145,6 +145,33 @@ def test_apply_real_diff_with_non_ascii_path(repo: Path) -> None:
     assert weird.read_text() == "x = 2\n"
 
 
+def test_apply_real_diff_with_ascii_spaced_path(repo: Path) -> None:
+    """Modern git emits an ASCII-spaced path UNQUOTED:
+    ``diff --git a/src/my file.py b/src/my file.py`` plus a trailing
+    tab on the ``--- ``/``+++ `` rows. The patcher must extract the
+    real path so the safety layer sees what ``git apply`` will mutate,
+    and the apply pipeline must succeed end-to-end."""
+    weird = repo / "src" / "my file.py"
+    weird.write_text("x = 1\n")
+    _git("add", "--", "src/my file.py", cwd=repo)
+    _git(
+        "-c", "user.email=test@example.com",
+        "-c", "user.name=Test",
+        "commit", "-q", "-m", "add spaced",
+        cwd=repo,
+    )
+    weird.write_text("x = 2\n")
+    diff = _diff(repo)
+    # Confirm git emitted the unquoted form (the case this test covers).
+    assert "diff --git a/src/my file.py b/src/my file.py" in diff
+    assert '"' not in diff.split("\n")[0]
+    _git("checkout", "--", "src/my file.py", cwd=repo)
+
+    written = _patcher(repo).apply_diff(diff, ["T1"])
+    assert written == [weird]
+    assert weird.read_text() == "x = 2\n"
+
+
 def test_apply_real_diff_with_payload_resembling_header(repo: Path) -> None:
     """A real diff whose hunk *adds* a line whose content begins with
     ``++ b/...`` will appear in the diff as ``+++ b/...`` — visually
