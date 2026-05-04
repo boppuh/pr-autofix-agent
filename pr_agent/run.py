@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -355,9 +356,6 @@ def _collect_file_contents(repo_root: Path, thread: ReviewThread) -> dict[str, s
     return contents
 
 
-import contextlib  # noqa: E402  (used by _build_repo_context below)
-
-
 def _build_repo_context(
     repo_root: Path,
     threads: list[ReviewThread],
@@ -391,15 +389,17 @@ def _build_repo_context(
     if tree:
         sections.append("--- file tree ---\n" + _truncate(tree, 5000))
 
-    # README / CLAUDE.md
+    # README / CLAUDE.md — break only on successful read
     for fname in ("README.md", "CLAUDE.md"):
         f = repo_root / fname
         if f.exists() and f.is_file():
-            with contextlib.suppress(OSError):
+            try:
                 sections.append(
                     f"--- {fname} ---\n" + _truncate(f.read_text(errors="replace"), 5000)
                 )
-            break
+                break
+            except OSError:
+                pass
 
     # File excerpts referenced by the threads
     excerpts: list[str] = []
@@ -431,7 +431,7 @@ def _truncate(s: str, max_bytes: int) -> str:
 def _format_reply(patch: Patch, sha: str) -> str:
     files = "\n".join(f"- `{f.path}`" for f in patch.files)
     return (
-        f"🤖 **pr-autofix-agent** applied a fix in `{sha[:7]}`:\n\n"
+        f"\U0001f916 **pr-autofix-agent** applied a fix in `{sha[:7]}`:\n\n"
         f"{patch.summary}\n\n"
         f"Files changed:\n{files}\n"
     )
@@ -449,7 +449,7 @@ def _escalate(
         gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
         gh.create_pr_comment(
             inputs.pr_number,
-            f"🤖 **pr-autofix-agent** is escalating to a human reviewer.\n\n"
+            f"\U0001f916 **pr-autofix-agent** is escalating to a human reviewer.\n\n"
             f"Reason: `{reason.value}`\n"
             f"Unresolved Bugbot threads: {len(unresolved)}\n",
         )
