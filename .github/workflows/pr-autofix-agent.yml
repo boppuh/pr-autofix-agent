@@ -110,5 +110,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-autofix-state-${{ inputs.pr_number }}
-          path: pr_agent_state.json
+          path: .pr-agent-state.json
           if-no-files-found: ignore

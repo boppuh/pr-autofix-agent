@@ -194,15 +194,32 @@ class EscalationReason(StrEnum):
     UNSAFE_PATCH = "unsafe_patch"
     RUNTIME_BUDGET_EXHAUSTED = "runtime_budget_exhausted"
     MISSING_LLM_CREDENTIAL = "missing_llm_credential"
+    NO_PROGRESS = "no_progress"
 
 
-@dataclass
+@dataclass(kw_only=True)
 class AgentRunReport:
+    """Persisted state for a single agent run.
+
+    The first four fields are the spec surface for `.pr-agent-state.json`:
+    `round`, `processed_comment_hashes`, `thread_attempt_counts`,
+    `previous_unresolved_count`. The rest is the audit trail kept for
+    debugging and the escalation comment.
+
+    `kw_only=True` lets us put the spec fields (with defaults) before the
+    required `pr_number` field; `dataclasses.asdict` then serialises them
+    in that order at the top of the JSON file.
+    """
+
+    round: int = 0
+    processed_comment_hashes: list[str] = field(default_factory=list)
+    thread_attempt_counts: dict[str, int] = field(default_factory=dict)
+    previous_unresolved_count: int | None = None
     pr_number: int
-    rounds: list[RoundResult] = field(default_factory=list)
     escalated: bool = False
     escalation_reason: EscalationReason | None = None
     final_unresolved_thread_ids: list[str] = field(default_factory=list)
+    rounds: list[RoundResult] = field(default_factory=list)
 
 
 # --- PR + checks -----------------------------------------------------------

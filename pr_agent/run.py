@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd()).resolve()
     repo_cfg = load_target_repo_config(repo_root)
 
-    state_path = repo_root / "pr_agent_state.json"
+    state_path = repo_root / ".pr-agent-state.json"
     state = AgentState(inputs.pr_number, persist_path=state_path)
 
     gh_token = require_env("GITHUB_TOKEN")
@@ -112,6 +112,20 @@ def main(argv: list[str] | None = None) -> int:
         if not threads:
             log.info("No unresolved Bugbot threads. Done.")
             break
+
+        # Stop-on-no-progress guard: from round 2 onward, escalate if the
+        # unresolved count didn't decrease since the previous round.
+        if not state.start_round(len(threads)):
+            _escalate(
+                gh,
+                inputs,
+                state,
+                EscalationReason.NO_PROGRESS,
+                [t.id for t in threads],
+            )
+            gh.close()
+            return 0
+
         if len(threads) > safety.max_comments_per_round:
             log.info(
                 "Capping %d threads to max_comments_per_round=%d",
@@ -135,10 +149,12 @@ def main(argv: list[str] | None = None) -> int:
 
         patches: list[tuple[ReviewThread, Patch]] = []
         for thread in triage.fixable:
-            if state.already_handled(thread.id, thread.body_text):
-                round_result.skipped.append((thread.id, "already handled"))
+            if state.already_processed(thread.root_comment):
+                round_result.skipped.append((thread.id, "already processed (dedupe)"))
                 continue
             file_contents = _collect_file_contents(repo_root, thread)
+            attempt_no = state.increment_attempt(thread.id)
+            log.info("Thread %s: attempt #%d", thread.id, attempt_no)
             try:
                 patch = llm.propose_patch(
                     thread=thread,
@@ -221,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
                 gh.resolve_thread(thread.id)
             except Exception as e:
                 log.warning("Failed to resolve thread %s: %s", thread.id, e)
-            state.mark_handled(thread.id, thread.body_text)
+            state.mark_processed(thread.root_comment)
 
         state.record_round(round_result)
         last_failure = None
