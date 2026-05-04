@@ -13,6 +13,7 @@ from .github_client import GitHubClient
 from .llm import LLMResponseError, make_provider
 from .llm._factory import default_model_for, env_var_for
 from .models import (
+    CommandResult,
     EscalationReason,
     Patch,
     PatchFile,
@@ -283,6 +284,33 @@ def main(argv: list[str] | None = None) -> int:
             failure_text = Validator.format_failure(round_result.validation)
             last_failure = failure_text
             patcher.revert_uncommitted(applied_paths)
+
+            # The patch is reverted at this point, so EVERY Bugbot thread on
+            # the PR is still unresolved — not just the live_fixable subset.
+            # Report the full set so the escalation comment / state file
+            # match reality (consistent with NO_PROGRESS, MAX_ROUNDS, and
+            # RUNTIME_BUDGET_EXHAUSTED).
+            unresolved_ids = [t.id for t in threads]
+
+            if safety.exit_on_validation_failure:
+                # Phase 10 default: post a PR comment summarising the failed
+                # command, apply the agent:failed-validation label, and exit.
+                first = round_result.validation.first_failure
+                _post_validation_failure(gh, inputs.pr_number, first)
+                round_result.error = "validation failed (exit-on-failure)"
+                state.record_round(round_result)
+                _escalate(
+                    gh,
+                    inputs,
+                    state,
+                    EscalationReason.VALIDATION_FAILED,
+                    unresolved_ids,
+                )
+                gh.close()
+                return 0
+
+            # Retry path: feed the failure into the next LLM round; escalate
+            # only if we see the same failure signature twice in a row.
             sig = AgentState.signature_for(failure_text)
             seen = state.record_validation_failure(sig)
             round_result.error = f"validation failed (sig {sig}, seen {seen}x)"
@@ -293,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
                     inputs,
                     state,
                     EscalationReason.REPEATED_VALIDATION_FAILURE,
-                    [t.id for t in threads],
+                    unresolved_ids,
                 )
                 return 0
             continue
@@ -426,6 +454,38 @@ def _truncate(s: str, max_bytes: int) -> str:
     if len(raw) <= max_bytes:
         return s
     return raw[:max_bytes].decode("utf-8", errors="replace") + f"\n... [truncated, original {len(raw)} bytes] ..."
+
+
+def _post_validation_failure(
+    gh: GitHubClient,
+    pr_number: int,
+    failure: CommandResult | None,
+) -> None:
+    """Post a PR comment summarising the failed validation command and
+    apply the ``agent:failed-validation`` label.
+
+    Both calls are best-effort — failures are logged but never raise so
+    they don't block the escalation path that follows.
+    """
+    if failure is None:
+        body = "🤖 **pr-autofix-agent** validation failed (no per-command result captured)."
+    else:
+        duration = f"{failure.duration_s:.1f}s"
+        stderr = failure.stderr_tail or "(no stderr captured)"
+        body = (
+            f"🤖 **pr-autofix-agent** validation failed.\n\n"
+            f"**Failed command:** `{failure.name}` "
+            f"(exit {failure.exit_code}, {duration})\n\n"
+            f"```\n{stderr}\n```\n"
+        )
+    try:
+        gh.create_pr_comment(pr_number, body)
+    except Exception as e:
+        log.warning("Could not post validation-failure comment: %s", e)
+    try:
+        gh.add_labels(pr_number, ["agent:failed-validation"])
+    except Exception as e:
+        log.warning("Could not apply agent:failed-validation label: %s", e)
 
 
 def _format_reply(patch: Patch, sha: str) -> str:

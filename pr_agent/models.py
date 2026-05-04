@@ -161,13 +161,32 @@ class ValidateCommand:
 
 
 @dataclass
-class ValidationResult:
+class CommandResult:
+    """Result of running a single validation command."""
+
     name: str
     ok: bool
     exit_code: int
     stdout_tail: str = ""
     stderr_tail: str = ""
     duration_s: float = 0.0
+
+
+@dataclass
+class ValidationResult:
+    """Aggregate result of running all configured validation commands.
+
+    The Phase 10 spec wraps individual command results in this top-level
+    object with an explicit ``success`` flag. ``success`` is False if any
+    command failed.
+    """
+
+    success: bool
+    command_results: list[CommandResult] = field(default_factory=list)
+
+    @property
+    def first_failure(self) -> CommandResult | None:
+        return next((c for c in self.command_results if not c.ok), None)
 
 
 # --- Round / report --------------------------------------------------------
@@ -178,18 +197,21 @@ class RoundResult:
     round_no: int
     fixed_thread_ids: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
-    validation: list[ValidationResult] = field(default_factory=list)
+    validation: ValidationResult = field(
+        default_factory=lambda: ValidationResult(success=True)
+    )
     commit_sha: str | None = None
     error: str | None = None
 
     @property
     def validation_ok(self) -> bool:
-        return all(v.ok for v in self.validation)
+        return self.validation.success
 
 
 class EscalationReason(StrEnum):
     MAX_ROUNDS = "max_rounds"
     REPEATED_VALIDATION_FAILURE = "repeated_validation_failure"
+    VALIDATION_FAILED = "validation_failed"
     NO_FIXABLE_THREADS = "no_fixable_threads"
     UNSAFE_PATCH = "unsafe_patch"
     RUNTIME_BUDGET_EXHAUSTED = "runtime_budget_exhausted"
@@ -254,6 +276,7 @@ class SafetyLimits:
     max_patch_lines: int = 800
     max_files_touched: int = 15
     max_runtime_minutes: int = 20
+    exit_on_validation_failure: bool = True
 
 
 @dataclass
