@@ -55,7 +55,6 @@ Output strictly valid JSON:
 class LLMResponseError(Exception):
     """Raised when the provider returns text that doesn't decode to JSON."""
 
-
 @runtime_checkable
 class LLMProvider(Protocol):
     """Every concrete provider exposes the same triage/patch surface."""
@@ -132,7 +131,7 @@ def format_patch_user(
     if pr_diff_excerpt:
         parts += ["", "PR diff (truncated):", "```diff", pr_diff_excerpt, "```"]
     if parts:
-        parts.append("")
+        parts.append("")  # blank line separator only when prior context exists
     parts += [
         f"Thread path: {thread.path or '(none)'}",
         f"Thread line: {thread.line if thread.line is not None else '(none)'}",
