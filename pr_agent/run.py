@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -14,6 +15,7 @@ from .llm._factory import default_model_for, env_var_for
 from .models import (
     EscalationReason,
     Patch,
+    PatchFile,
     ReviewThread,
     RoundResult,
     WorkflowInputs,
@@ -147,62 +149,134 @@ def main(argv: list[str] | None = None) -> int:
             state.record_round(round_result)
             break
 
-        patches: list[tuple[ReviewThread, Patch]] = []
+        # Skip already-processed threads (dedupe across the whole run).
+        live_fixable: list[ReviewThread] = []
         for thread in triage.fixable:
             if state.already_processed(thread.root_comment):
                 round_result.skipped.append((thread.id, "already processed (dedupe)"))
-                continue
-            file_contents = _collect_file_contents(repo_root, thread)
-            attempt_no = state.increment_attempt(thread.id)
-            log.info("Thread %s: attempt #%d", thread.id, attempt_no)
-            try:
-                patch = llm.propose_patch(
-                    thread=thread,
-                    file_contents=file_contents,
-                    max_files=safety.max_files_touched,
-                    prior_failure=last_failure,
-                    pr_title=pr.title,
-                    pr_body_excerpt=pr.body[:2000] if pr.body else None,
-                    pr_diff_excerpt=pr_diff,
-                )
-            except LLMResponseError as e:
-                # Truncated / malformed JSON — skip the thread, don't crash.
-                log.warning("LLM patch output unusable for thread %s: %s", thread.id, e)
-                round_result.skipped.append((thread.id, f"llm output unusable: {e}"))
-                continue
-            except Exception as e:  # provider-side errors (rate limits, 5xx, etc.)
-                log.warning("LLM call failed for thread %s: %s", thread.id, e)
-                round_result.skipped.append((thread.id, f"llm error: {e}"))
-                continue
-            try:
-                report = patcher.check_safe(patch)
-            except UnsafePatchError as e:
-                round_result.skipped.append((thread.id, f"unsafe: {e}"))
-                continue
-            if not report.ok:
-                round_result.skipped.append((thread.id, f"unsafe: {'; '.join(report.reasons)}"))
-                continue
-            patches.append((thread, patch))
-
-        if not patches:
-            log.info("Round %d produced no safe patches.", round_no)
+            else:
+                live_fixable.append(thread)
+        if not live_fixable:
+            log.info("Round %d: nothing new to fix after dedupe.", round_no)
             state.record_round(round_result)
             break
 
-        if inputs.dry_run:
-            for thread, patch in patches:
-                log.info(
-                    "[DRY RUN] would patch %s for thread %s: %s",
-                    patch.touched_paths(),
-                    thread.id,
-                    patch.summary,
-                )
-            state.record_round(round_result)
-            return 0
-
         applied_paths: list[Path] = []
-        for _, patch in patches:
-            applied_paths.extend(patcher.apply(patch))
+        patches: list[tuple[ReviewThread, Patch]] = []
+        batch_used = False
+
+        # --- Phase 8: batched generate_patch first --------------------------
+        try:
+            repo_context = _build_repo_context(repo_root, live_fixable, budget=32_000)
+            diff = llm.generate_patch(
+                pr_title=pr.title,
+                pr_body=pr.body or "",
+                pr_diff=pr_diff,
+                comments=live_fixable,
+                repo_context=repo_context,
+                validation_commands=[c.run for c in repo_cfg.validate_],
+            )
+        except LLMResponseError as e:
+            log.info("Batch generate_patch rejected (%s); falling back to per-thread.", e)
+            diff = None
+        except Exception as e:  # provider-side errors
+            log.info("Batch generate_patch failed (%s); falling back to per-thread.", e)
+            diff = None
+
+        if diff and diff.startswith("ESCALATE:"):
+            reason = diff.removeprefix("ESCALATE:").strip() or "model returned ESCALATE"
+            log.info("Model escalated batch: %s", reason)
+            for t in live_fixable:
+                round_result.skipped.append((t.id, f"escalated by model: {reason}"))
+                state.increment_attempt(t.id)
+            state.record_round(round_result)
+            continue
+
+        if diff is not None:
+            # Dry-run check BEFORE we mutate anything via git apply.
+            if inputs.dry_run:
+                log.info(
+                    "[DRY RUN] would apply batched diff for %d thread(s)",
+                    len(live_fixable),
+                )
+                for t in live_fixable:
+                    state.increment_attempt(t.id)
+                state.record_round(round_result)
+                return 0
+            try:
+                applied_paths = patcher.apply_diff(diff, [t.id for t in live_fixable])
+            except UnsafePatchError as e:
+                # Don't increment attempts here — the per-thread fallback below
+                # will increment per thread as it actually consumes attempts.
+                log.info("Batched diff rejected by Patcher (%s); falling back.", e)
+                applied_paths = []
+                patches = []
+            else:
+                for t in live_fixable:
+                    state.increment_attempt(t.id)
+                # Synthesize a single Patch for the commit message + replies.
+                rel_paths = [str(p.relative_to(repo_root)) for p in applied_paths]
+                synthetic = Patch(
+                    thread_id=f"batch-r{round_no}",
+                    files=[PatchFile(path=p, new_content="", rationale="batched") for p in rel_paths],
+                    summary=f"batched fix for {len(live_fixable)} thread(s)",
+                )
+                patches = [(t, synthetic) for t in live_fixable]
+                batch_used = True
+                log.info("Batched patch applied: %d files", len(applied_paths))
+
+        # --- Per-thread fallback (Phase 5 path) -----------------------------
+        if not batch_used:
+            for thread in live_fixable:
+                file_contents = _collect_file_contents(repo_root, thread)
+                attempt_no = state.increment_attempt(thread.id)
+                log.info("Thread %s: per-thread attempt #%d", thread.id, attempt_no)
+                try:
+                    patch = llm.propose_patch(
+                        thread=thread,
+                        file_contents=file_contents,
+                        max_files=safety.max_files_touched,
+                        prior_failure=last_failure,
+                        pr_title=pr.title,
+                        pr_body_excerpt=pr.body[:2000] if pr.body else None,
+                        pr_diff_excerpt=pr_diff,
+                    )
+                except LLMResponseError as e:
+                    log.warning("LLM patch output unusable for thread %s: %s", thread.id, e)
+                    round_result.skipped.append((thread.id, f"llm output unusable: {e}"))
+                    continue
+                except Exception as e:
+                    log.warning("LLM call failed for thread %s: %s", thread.id, e)
+                    round_result.skipped.append((thread.id, f"llm error: {e}"))
+                    continue
+                try:
+                    report = patcher.check_safe(patch)
+                except UnsafePatchError as e:
+                    round_result.skipped.append((thread.id, f"unsafe: {e}"))
+                    continue
+                if not report.ok:
+                    round_result.skipped.append((thread.id, f"unsafe: {'; '.join(report.reasons)}"))
+                    continue
+                patches.append((thread, patch))
+
+            if not patches:
+                log.info("Round %d produced no safe patches.", round_no)
+                state.record_round(round_result)
+                break
+
+            if inputs.dry_run:
+                for thread, patch in patches:
+                    log.info(
+                        "[DRY RUN] would patch %s for thread %s: %s",
+                        patch.touched_paths(),
+                        thread.id,
+                        patch.summary,
+                    )
+                state.record_round(round_result)
+                return 0
+
+            for _, patch in patches:
+                applied_paths.extend(patcher.apply(patch))
 
         round_result.validation = validator.run()
         if not round_result.validation_ok:
@@ -282,10 +356,82 @@ def _collect_file_contents(repo_root: Path, thread: ReviewThread) -> dict[str, s
     return contents
 
 
+def _build_repo_context(
+    repo_root: Path,
+    threads: list[ReviewThread],
+    *,
+    budget: int = 32_000,
+) -> str:
+    """Build the `repo_context` string for the batched generate_patch call.
+
+    Includes (in order, each truncated to its own sub-budget):
+    1. file tree from `git ls-files`
+    2. README.md / CLAUDE.md excerpt if present
+    3. excerpts of files referenced by any thread
+    Total truncated to ``budget`` bytes.
+    """
+    sections: list[str] = []
+
+    # File tree
+    try:
+        import subprocess as _sp
+
+        out = _sp.run(
+            ["git", "ls-files"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        tree = out.stdout if out.returncode == 0 else ""
+    except OSError:
+        tree = ""
+    if tree:
+        sections.append("--- file tree ---\n" + _truncate(tree, 5000))
+
+    # README / CLAUDE.md — break only on successful read
+    for fname in ("README.md", "CLAUDE.md"):
+        f = repo_root / fname
+        if f.exists() and f.is_file():
+            try:
+                sections.append(
+                    f"--- {fname} ---\n" + _truncate(f.read_text(errors="replace"), 5000)
+                )
+                break
+            except OSError:
+                pass
+
+    # File excerpts referenced by the threads
+    excerpts: list[str] = []
+    seen: set[str] = set()
+    for t in threads:
+        if not t.path or t.path in seen:
+            continue
+        seen.add(t.path)
+        f = repo_root / t.path
+        if f.exists() and f.is_file():
+            with contextlib.suppress(OSError):
+                excerpts.append(
+                    f"=== {t.path} ===\n" + _truncate(f.read_text(errors="replace"), 4000)
+                )
+    if excerpts:
+        sections.append("--- file excerpts ---\n" + "\n\n".join(excerpts))
+
+    out_text = "\n\n".join(sections)
+    return _truncate(out_text, budget)
+
+
+def _truncate(s: str, max_bytes: int) -> str:
+    raw = s.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return s
+    return raw[:max_bytes].decode("utf-8", errors="replace") + f"\n... [truncated, original {len(raw)} bytes] ..."
+
+
 def _format_reply(patch: Patch, sha: str) -> str:
     files = "\n".join(f"- `{f.path}`" for f in patch.files)
     return (
-        f"🤖 **pr-autofix-agent** applied a fix in `{sha[:7]}`:\n\n"
+        f"\U0001f916 **pr-autofix-agent** applied a fix in `{sha[:7]}`:\n\n"
         f"{patch.summary}\n\n"
         f"Files changed:\n{files}\n"
     )
@@ -303,7 +449,7 @@ def _escalate(
         gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
         gh.create_pr_comment(
             inputs.pr_number,
-            f"🤖 **pr-autofix-agent** is escalating to a human reviewer.\n\n"
+            f"\U0001f916 **pr-autofix-agent** is escalating to a human reviewer.\n\n"
             f"Reason: `{reason.value}`\n"
             f"Unresolved Bugbot threads: {len(unresolved)}\n",
         )
