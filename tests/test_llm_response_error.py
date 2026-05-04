@@ -24,6 +24,22 @@ def test_extract_json_strips_code_fence():
     assert out == {"x": 1}
 
 
+def test_patch_prompt_no_leading_newline_without_pr_context(thread_factory):
+    """Regression: when no PR context (title/body/diff) is provided the
+    formatted user prompt must start at 'Thread path: ...', not with a stray
+    leading blank line."""
+    from pr_agent.llm_client import _format_patch_user
+
+    out = _format_patch_user(
+        thread_factory(),
+        file_contents={"src/foo.py": "x"},
+        max_files=5,
+        prior_failure=None,
+    )
+    assert not out.startswith("\n")
+    assert out.startswith("Thread path:")
+
+
 def test_classify_returns_human_required_on_truncated_response(monkeypatch, thread_factory):
     """Regression: when the classifier model returns non-JSON, classify must
     fall back to HUMAN_REQUIRED instead of letting LLMResponseError escape and

@@ -158,8 +158,9 @@ def _format_patch_user(
             pr_diff_excerpt,
             "```",
         ]
+    if parts:
+        parts.append("")  # blank line separator only when prior context exists
     parts += [
-        "",
         f"Thread path: {thread.path or '(none)'}",
         f"Thread line: {thread.line if thread.line is not None else '(none)'}",
         f"File budget: at most {max_files} file(s).",
