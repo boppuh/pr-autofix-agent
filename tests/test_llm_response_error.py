@@ -73,3 +73,36 @@ def test_classify_returns_needs_human_on_truncated_response(monkeypatch, thread_
     assert cls.category == "NEEDS_HUMAN"
     assert "failed validation" in cls.reason
     assert cls.thread_id == "T_1"
+
+
+# --- validate_diff_response (Phase 8 syntactic checks) -----------------
+
+
+def test_validate_diff_response_passes_through_escalate():
+    from pr_agent.llm._base import validate_diff_response
+
+    out = validate_diff_response("ESCALATE: needs product input")
+    assert out.startswith("ESCALATE:")
+
+
+def test_validate_diff_response_strips_whitespace():
+    from pr_agent.llm._base import validate_diff_response
+
+    raw = "\n\n  diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    out = validate_diff_response(raw)
+    assert out.startswith("diff --git")
+
+
+def test_validate_diff_response_rejects_markdown_fence():
+    from pr_agent.llm._base import LLMResponseError, validate_diff_response
+
+    raw = "```diff\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n```"
+    with pytest.raises(LLMResponseError, match="markdown fence"):
+        validate_diff_response(raw)
+
+
+def test_validate_diff_response_rejects_prose():
+    from pr_agent.llm._base import LLMResponseError, validate_diff_response
+
+    with pytest.raises(LLMResponseError, match="not a unified diff"):
+        validate_diff_response("Sure, here is the fix: change line 5 to do X.")

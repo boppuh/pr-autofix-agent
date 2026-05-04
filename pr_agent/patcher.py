@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,6 +75,57 @@ class Patcher:
                 reasons.append(f"protected path: {f.path}")
         return PatchSafetyReport(ok=not reasons, reasons=reasons)
 
+    def apply_diff(self, diff_text: str, thread_ids: list[str]) -> list[Path]:
+        """Apply a unified-diff string from the Phase 8 batched LLM call.
+
+        Validates the diff (forbidden globs, protected paths, file/line caps),
+        runs ``git apply --check`` to confirm patchability, then ``git apply``
+        to apply. Raises :class:`UnsafePatchError` on any guard rejection or
+        patch-tool failure.
+        """
+        if not diff_text.strip():
+            raise UnsafePatchError("empty diff")
+        paths = _paths_from_diff(diff_text)
+        if not paths:
+            raise UnsafePatchError("diff does not name any files")
+        # File-count cap.
+        if len(paths) > self._max_files:
+            raise UnsafePatchError(
+                f"too many files ({len(paths)} > {self._max_files})"
+            )
+        # Path-safety checks (forbidden globs + protected paths + traversal).
+        for p in paths:
+            if p.startswith("/") or ".." in Path(p).parts:
+                raise UnsafePatchError(f"non-relative path: {p}")
+            if any(fnmatch.fnmatch(p, pat) for pat in FORBIDDEN_GLOBS):
+                raise UnsafePatchError(f"forbidden path: {p}")
+            if matches_any_protected(p, self._protected):
+                raise UnsafePatchError(f"protected path: {p}")
+        # Line cap (count added + removed payload lines, ignore headers).
+        changed = _count_changed_lines(diff_text)
+        if changed > self._max_patch_lines:
+            raise UnsafePatchError(
+                f"patch too large ({changed} > {self._max_patch_lines} lines)"
+            )
+        # Stage diff to a temp file and check + apply.
+        with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as tmp:
+            tmp.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
+            tmp_path = tmp.name
+        try:
+            try:
+                self._git("apply", "--check", tmp_path)
+            except RuntimeError as e:
+                raise UnsafePatchError(f"git apply --check failed: {e}") from e
+            self._git("apply", tmp_path)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+        log.info(
+            "Applied batched diff for threads %s: %d files",
+            thread_ids,
+            len(paths),
+        )
+        return [self._root / p for p in paths]
+
     def apply(self, patch: Patch) -> list[Path]:
         report = self.check_safe(patch)
         if not report.ok:
@@ -124,3 +177,36 @@ class Patcher:
         return result.stdout
 
 
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
+_PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(\S+)$", re.MULTILINE)
+
+
+def _paths_from_diff(diff_text: str) -> list[str]:
+    """Extract repo-relative paths touched by a unified diff.
+
+    Prefers the b-side of ``diff --git`` headers; falls back to ``+++ b/``
+    lines for diffs that omit the ``diff --git`` preamble.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+    for _, b in _DIFF_GIT_RE.findall(diff_text):
+        if b not in seen:
+            paths.append(b)
+            seen.add(b)
+    if not paths:
+        for b in _PLUS_FILE_RE.findall(diff_text):
+            if b not in seen:
+                paths.append(b)
+                seen.add(b)
+    return paths
+
+
+def _count_changed_lines(diff_text: str) -> int:
+    """Count payload +/- lines, excluding the +++ / --- header rows."""
+    count = 0
+    for line in diff_text.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith(("+", "-")):
+            count += 1
+    return count

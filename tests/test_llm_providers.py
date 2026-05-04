@@ -160,6 +160,129 @@ def test_openai_propose_patch_includes_pr_context(monkeypatch):
     assert "PR diff (truncated):" in user_input
 
 
+_VALID_DIFF = """diff --git a/src/foo.py b/src/foo.py
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -1,2 +1,2 @@
+-old
++new
+"""
+
+
+def test_anthropic_generate_patch_passes_through_diff(monkeypatch):
+    from pr_agent.llm import anthropic as a_mod
+
+    fake = MagicMock()
+    fake.messages.create.return_value = _anthropic_text_response(_VALID_DIFF)
+    monkeypatch.setattr(a_mod, "Anthropic", lambda **kw: fake)
+
+    p = make_provider("anthropic", model="m", api_key="k")
+    out = p.generate_patch(
+        pr_title="feat: foo",
+        pr_body="body",
+        pr_diff="diff goes here",
+        comments=[_thread()],
+        repo_context="ctx",
+        validation_commands=["pytest -x"],
+    )
+    assert "diff --git a/src/foo.py" in out
+    # System prompt is the Phase 8 verbatim text; cache_control still set.
+    args = fake.messages.create.call_args
+    sys_block = args.kwargs["system"][0]
+    assert "autonomous PR repair agent" in sys_block["text"]
+    assert sys_block["cache_control"] == {"type": "ephemeral"}
+    user = args.kwargs["messages"][0]["content"]
+    assert "feat: foo" in user
+    assert "pytest -x" in user
+
+
+def test_anthropic_generate_patch_passes_through_escalate(monkeypatch):
+    from pr_agent.llm import anthropic as a_mod
+
+    fake = MagicMock()
+    fake.messages.create.return_value = _anthropic_text_response(
+        "ESCALATE: needs product input on retention policy"
+    )
+    monkeypatch.setattr(a_mod, "Anthropic", lambda **kw: fake)
+    p = make_provider("anthropic", model="m", api_key="k")
+    out = p.generate_patch(
+        pr_title="t",
+        pr_body="b",
+        pr_diff="",
+        comments=[_thread()],
+        repo_context="",
+        validation_commands=[],
+    )
+    assert out.startswith("ESCALATE:")
+    assert "retention policy" in out
+
+
+def test_anthropic_generate_patch_rejects_markdown_fence(monkeypatch):
+    from pr_agent.llm import _base
+    from pr_agent.llm import anthropic as a_mod
+
+    fake = MagicMock()
+    fake.messages.create.return_value = _anthropic_text_response(
+        "```diff\n" + _VALID_DIFF + "```"
+    )
+    monkeypatch.setattr(a_mod, "Anthropic", lambda **kw: fake)
+    p = make_provider("anthropic", model="m", api_key="k")
+    with pytest.raises(_base.LLMResponseError, match="markdown fence"):
+        p.generate_patch(
+            pr_title="t",
+            pr_body="b",
+            pr_diff="",
+            comments=[_thread()],
+            repo_context="",
+            validation_commands=[],
+        )
+
+
+def test_anthropic_generate_patch_rejects_non_diff(monkeypatch):
+    from pr_agent.llm import _base
+    from pr_agent.llm import anthropic as a_mod
+
+    fake = MagicMock()
+    fake.messages.create.return_value = _anthropic_text_response(
+        "Sure, here's some prose explaining the bug fix..."
+    )
+    monkeypatch.setattr(a_mod, "Anthropic", lambda **kw: fake)
+    p = make_provider("anthropic", model="m", api_key="k")
+    with pytest.raises(_base.LLMResponseError, match="not a unified diff"):
+        p.generate_patch(
+            pr_title="t",
+            pr_body="b",
+            pr_diff="",
+            comments=[_thread()],
+            repo_context="",
+            validation_commands=[],
+        )
+
+
+def test_openai_generate_patch_disables_json_mode(monkeypatch):
+    """generate_patch wants raw text (a diff), not JSON. The provider must
+    NOT pass `text={'format': {'type': 'json_object'}}` to responses.create
+    on this path."""
+    from pr_agent.llm import openai as o_mod
+
+    fake = MagicMock()
+    fake.responses.create.return_value = _openai_response(_VALID_DIFF)
+    monkeypatch.setattr(o_mod, "OpenAI", lambda **kw: fake)
+    p = make_provider("openai", model="gpt-5-codex", api_key="k")
+    out = p.generate_patch(
+        pr_title="t",
+        pr_body="b",
+        pr_diff="d",
+        comments=[_thread()],
+        repo_context="ctx",
+        validation_commands=["pytest -x"],
+    )
+    assert "diff --git" in out
+    args = fake.responses.create.call_args
+    assert "text" not in args.kwargs
+    assert args.kwargs["prompt_cache_key"] == "pr-agent/generate-patch"
+
+
 def test_protocol_runtime_check():
     """make_provider should return something that satisfies the Protocol."""
     from pr_agent.llm import anthropic as a_mod
