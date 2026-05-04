@@ -114,7 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         threads = gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)
         if not threads:
             log.info("No unresolved Bugbot threads. Done.")
-            break
+            _post_clean(gh, inputs.pr_number)
+            gh.close()
+            return 0
 
         # Stop-on-no-progress guard: from round 2 onward, escalate if the
         # unresolved count didn't decrease since the previous round.
@@ -146,6 +148,31 @@ def main(argv: list[str] | None = None) -> int:
         round_result.skipped.extend((t.id, r) for t, r in triage.ignored)
 
         if not triage.fixable:
+            # Phase 11 spec: if every thread routed to NEEDS_HUMAN, escalate
+            # explicitly (label + summary comment + return). If everything is
+            # IGNORE-only (or both lists empty), break out without escalation
+            # — IGNORE means non-actionable, no human attention needed.
+            if triage.skipped:
+                log.info("All threads routed to NEEDS_HUMAN; escalating.")
+                body = _summarize_human_threads(triage.skipped)
+                # Each call gets its own try/except so a comment-API hiccup
+                # doesn't drop the label (and vice versa) — humans need at
+                # least one of the two signals to discover the PR.
+                try:
+                    gh.create_pr_comment(inputs.pr_number, body)
+                except Exception as e:
+                    log.warning("Could not post all-needs-human comment: %s", e)
+                try:
+                    gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
+                except Exception as e:
+                    log.warning("Could not apply all-needs-human label: %s", e)
+                state.record_round(round_result)
+                state.escalate(
+                    EscalationReason.NO_FIXABLE_THREADS,
+                    [t.id for t in threads],
+                )
+                gh.close()
+                return 0
             log.info("No auto-fixable threads remaining.")
             state.record_round(round_result)
             break
@@ -497,6 +524,56 @@ def _format_reply(patch: Patch, sha: str) -> str:
     )
 
 
+def _post_clean(gh: GitHubClient, pr_number: int) -> None:
+    """Post the all-clean comment and apply the ``agent:clean`` label.
+
+    Called when the agent finds no unresolved Bugbot threads on the PR.
+    Both calls are best-effort.
+    """
+    try:
+        gh.create_pr_comment(
+            pr_number,
+            "🤖 **pr-autofix-agent** found no unresolved Cursor Bugbot comments.",
+        )
+    except Exception as e:
+        log.warning("Could not post clean comment: %s", e)
+    try:
+        gh.add_labels(pr_number, ["agent:clean"])
+    except Exception as e:
+        log.warning("Could not apply agent:clean label: %s", e)
+
+
+def _summarize_human_threads(skipped: list[tuple[ReviewThread, str]]) -> str:
+    """Build the all-needs-human escalation comment body.
+
+    Lists up to 20 NEEDS_HUMAN threads with their path/line and the rule
+    or LLM reason. The comment is a single Markdown block; truncated
+    with a "... and N more" tail past 20 entries.
+    """
+    lines = [
+        "🤖 **pr-autofix-agent** is escalating because every Bugbot comment "
+        "this round needs human review.",
+        "",
+        "Threads:",
+    ]
+    cap = 20
+    for thread, reason in skipped[:cap]:
+        if thread.path:
+            line_part = f":{thread.line}" if thread.line is not None else ""
+            location = f"`{thread.path}{line_part}`"
+        else:
+            location = "(no path)"
+        lines.append(f"- {location} — {reason}")
+    if len(skipped) > cap:
+        lines.append(f"... and {len(skipped) - cap} more.")
+    return "\n".join(lines)
+
+
+_REASON_LABEL_MAP: dict[EscalationReason, list[str]] = {
+    EscalationReason.MAX_ROUNDS: ["agent:max-rounds"],
+}
+
+
 def _escalate(
     gh: GitHubClient,
     inputs: WorkflowInputs,
@@ -505,8 +582,9 @@ def _escalate(
     unresolved: list[str],
 ) -> None:
     state.escalate(reason, unresolved)
+    labels = [inputs.needs_human_label, *_REASON_LABEL_MAP.get(reason, [])]
     try:
-        gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
+        gh.add_labels(inputs.pr_number, labels)
         gh.create_pr_comment(
             inputs.pr_number,
             f"\U0001f916 **pr-autofix-agent** is escalating to a human reviewer.\n\n"
