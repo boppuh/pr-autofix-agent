@@ -146,28 +146,57 @@ def test_apply_real_diff_with_non_ascii_path(repo: Path) -> None:
 
 
 def test_apply_real_diff_with_payload_resembling_header(repo: Path) -> None:
-    """A real diff whose hunk *contains* a line starting with ``+++ b/``
-    (added as content, e.g. a doc example showing diff syntax) must
-    apply cleanly. The state-machine tokenizer doesn't extract that
-    sentinel as a touched path; the apply pipeline doesn't reject it
-    either."""
+    """A real diff whose hunk *adds* a line whose content begins with
+    ``++ b/...`` will appear in the diff as ``+++ b/...`` — visually
+    indistinguishable from a real ``+++ b/`` file header. The
+    state-machine tokenizer must classify it as payload (because we're
+    inside a hunk), the safety check must not extract it as a touched
+    path, and the apply pipeline must succeed end-to-end.
+
+    Symmetrically: an added line whose content begins with ``-- a/...``
+    appears in the diff as ``+-- a/...`` (single ``+`` prefix). To
+    actually produce a ``--- a/...``-shaped *payload* line we need a
+    REMOVED line whose content starts with ``-- a/...``. We commit a
+    pre-existing ``-- a/foo`` line and remove it, plus add a ``++ b/foo``
+    line, so both adversarial header-shapes appear in one diff.
+    """
     target = repo / "src" / "hello.py"
+    # Pre-seed a line whose content starts with '-- a/...' so removing
+    # it produces a payload line of the form '--- a/<content>'.
     target.write_text(
         "def hello():\n"
         "    return 1\n"
-        "# doc: a unified-diff line looks like:\n"
-        "# +++ b/some/other/file.py\n"
-        "# --- a/some/other/file.py\n"
+        "-- a/looks/like/source/header.py\n"
+    )
+    _git("add", "src/hello.py", cwd=repo)
+    _git(
+        "-c", "user.email=test@example.com",
+        "-c", "user.name=Test",
+        "commit", "-q", "-m", "seed adversarial line",
+        cwd=repo,
+    )
+    # Now add a line whose content starts with '++ b/...' (rendering as
+    # '+++ b/...' in the diff) and remove the seeded '-- a/...' line.
+    target.write_text(
+        "def hello():\n"
+        "    return 1\n"
+        "++ b/looks/like/dest/header.py\n"
     )
     diff = _diff(repo)
+    # Confirm the diff actually contains both adversarial shapes —
+    # otherwise the test would silently regress to vacuous success.
+    assert "+++ b/looks/like/dest/header.py" in diff
+    assert "--- a/looks/like/source/header.py" in diff
     _git("checkout", "--", "src/hello.py", cwd=repo)
 
     written = _patcher(repo).apply_diff(diff, ["T1"])
     assert written == [target]
-    # The sentinel content survived as literal text in the file.
-    assert "+++ b/some/other/file.py" in target.read_text()
-    # ...but no spurious files were created for those payload lines.
-    assert not (repo / "some" / "other" / "file.py").exists()
+    # The added sentinel content actually landed in the file.
+    assert "++ b/looks/like/dest/header.py" in target.read_text()
+    # And no spurious files were created from those header-shaped
+    # payload lines.
+    assert not (repo / "looks" / "like" / "dest" / "header.py").exists()
+    assert not (repo / "looks" / "like" / "source" / "header.py").exists()
 
 
 def test_apply_real_rename_diff(repo: Path) -> None:
