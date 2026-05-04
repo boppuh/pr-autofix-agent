@@ -1,3 +1,23 @@
+"""Patch the working tree.
+
+The Phase 9 spec exposes four module-level free functions:
+
+- :func:`extract_touched_files` — every path the diff names (union of
+  ``diff --git`` and ``+++ b/`` headers).
+- :func:`count_patch_lines` — payload +/- line count.
+- :func:`violates_protected_paths` — predicate against a protected-path list.
+- :func:`apply_unified_diff` — full apply pipeline (guards, ``git apply
+  --check``, ``git apply``, post-apply ``git diff --check``, revert on
+  failure). Returns ``True`` on success, ``False`` on any rejection.
+
+The :class:`Patcher` class wraps the same primitives and translates
+rejections into typed :class:`UnsafePatchError` exceptions so the run
+loop can log specific reasons. Both APIs work; the class also enforces
+the project-specific :data:`FORBIDDEN_GLOBS` allowlist (CI workflows,
+lockfiles, ``.pr-agent.yml``) which the spec's free functions know
+nothing about.
+"""
+
 from __future__ import annotations
 
 import fnmatch
@@ -29,6 +49,169 @@ FORBIDDEN_GLOBS = [
 
 class UnsafePatchError(Exception):
     pass
+
+
+# --- Free functions (Phase 9 spec) ---------------------------------------
+
+
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
+_PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(\S+)$", re.MULTILINE)
+# Matches the +++ and --- file-header lines in unified diff format.
+# These are exactly three characters followed by a space and a path.
+_HEADER_LINE_RE = re.compile(r"^(?:\+\+\+|---) ")
+
+
+def extract_touched_files(diff_text: str) -> list[str]:
+    """Every repo-relative path the diff names.
+
+    Returns the union of paths from ``diff --git a/X b/Y`` headers and
+    ``+++ b/Y`` lines. ``git apply`` decides target files from the
+    ``---``/``+++`` headers, not from ``diff --git`` — so a malicious /
+    confused diff with mismatched headers (e.g. ``diff --git a/safe.py
+    b/safe.py`` but ``+++ b/.github/workflows/ci.yml``) would otherwise
+    pass safety checks against ``safe.py`` while ``git apply`` mutates
+    the workflow file. Validating the union closes that gap.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+    for _, b in _DIFF_GIT_RE.findall(diff_text):
+        if b and b != "/dev/null" and b not in seen:
+            paths.append(b)
+            seen.add(b)
+    for b in _PLUS_FILE_RE.findall(diff_text):
+        if b and b != "/dev/null" and b not in seen:
+            paths.append(b)
+            seen.add(b)
+    return paths
+
+
+def count_patch_lines(diff_text: str) -> int:
+    """Count payload +/- lines, excluding the ``+++`` / ``---`` header rows.
+
+    Header rows are exactly ``+++ <path>`` or ``--- <path>`` (three marker
+    characters followed by a space). Payload lines that happen to start with
+    ``--`` or ``++`` (e.g. a removed/added line whose content begins with
+    dashes) are still counted.
+    """
+    count = 0
+    for line in diff_text.splitlines():
+        if _HEADER_LINE_RE.match(line):
+            continue
+        if line.startswith(("+", "-")):
+            count += 1
+    return count
+
+
+def violates_protected_paths(files: list[str], protected_paths: list[str]) -> bool:
+    """True iff any of ``files`` matches a ``protected_paths`` entry.
+
+    Uses the shared :func:`pr_agent._paths.matches_any_protected` helper:
+    trailing-slash entries are directory prefixes; everything else is fnmatch.
+    """
+    return any(matches_any_protected(p, protected_paths) for p in files)
+
+
+def apply_unified_diff(
+    diff_text: str,
+    *,
+    repo_root: Path,
+    protected_paths: list[str],
+    max_files: int,
+    max_patch_lines: int,
+) -> bool:
+    """Run the full Phase 9 apply pipeline against ``repo_root``.
+
+    Returns ``True`` on success and leaves the working tree mutated.
+    Returns ``False`` on any rejection (logs the reason at INFO):
+
+    1. empty diff
+    2. diff names no files
+    3. ``len(files) > max_files``
+    4. :func:`violates_protected_paths`
+    5. ``count_patch_lines > max_patch_lines``
+    6. ``git apply --check`` fails
+    7. ``git apply`` fails
+    8. ``git diff --check`` fails after apply (whitespace errors / conflict
+       markers) — runs ``git apply --reverse`` to undo, then returns False
+    """
+    if not diff_text.strip():
+        log.info("apply_unified_diff: empty diff")
+        return False
+    files = extract_touched_files(diff_text)
+    if not files:
+        log.info("apply_unified_diff: diff does not name any files")
+        return False
+    if len(files) > max_files:
+        log.info("apply_unified_diff: too many files (%d > %d)", len(files), max_files)
+        return False
+    if violates_protected_paths(files, protected_paths):
+        log.info("apply_unified_diff: protected path touched")
+        return False
+    n_lines = count_patch_lines(diff_text)
+    if n_lines > max_patch_lines:
+        log.info(
+            "apply_unified_diff: patch too large (%d > %d lines)", n_lines, max_patch_lines
+        )
+        return False
+
+    # Stage diff to a temp file; check + apply + post-apply check.
+    with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as tmp:
+        tmp.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
+        tmp_path = tmp.name
+    try:
+        try:
+            _run_git(["apply", "--check", tmp_path], cwd=repo_root)
+        except RuntimeError as e:
+            log.info("apply_unified_diff: git apply --check failed: %s", e)
+            return False
+        try:
+            _run_git(["apply", tmp_path], cwd=repo_root)
+        except RuntimeError as e:
+            log.info("apply_unified_diff: git apply failed: %s", e)
+            return False
+
+        # Post-apply: git diff --check catches whitespace errors and merge-
+        # conflict markers (<<<<<<<, =======, >>>>>>>) that --check at the
+        # patch level can't see because they're valid diff hunks.
+        # Scope to only the files touched by this patch to avoid spurious
+        # failures from pre-existing uncommitted changes in other files.
+        try:
+            _run_git(["diff", "--check", "--"] + files, cwd=repo_root)
+        except RuntimeError as e:
+            log.info("apply_unified_diff: git diff --check failed; reverting: %s", e)
+            try:
+                _run_git(["apply", "--reverse", tmp_path], cwd=repo_root)
+            except RuntimeError as revert_err:  # working tree now in unknown state
+                log.warning(
+                    "apply_unified_diff: revert via git apply --reverse FAILED (%s); "
+                    "working tree may be inconsistent",
+                    revert_err,
+                )
+            return False
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    log.info("apply_unified_diff: applied %d file(s)", len(files))
+    return True
+
+
+def _run_git(args: list[str], *, cwd: Path) -> str:
+    """Run ``git <args>`` in ``cwd``. Raise :class:`RuntimeError` on non-zero exit."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (exit {result.returncode}): "
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout
+
+
+# --- Patcher class wrapper -----------------------------------------------
 
 
 @dataclass
@@ -78,56 +261,54 @@ class Patcher:
     def apply_diff(self, diff_text: str, thread_ids: list[str]) -> list[Path]:
         """Apply a unified-diff string from the Phase 8 batched LLM call.
 
-        Validates the diff (forbidden globs, protected paths, file/line caps),
-        runs ``git apply --check`` to confirm patchability, then ``git apply``
-        to apply. Raises :class:`UnsafePatchError` on any guard rejection or
-        patch-tool failure.
+        Runs the same guards as :func:`apply_unified_diff` but raises
+        :class:`UnsafePatchError` with a specific reason on any rejection
+        (rather than returning ``False``). Also enforces the project-specific
+        :data:`FORBIDDEN_GLOBS` allowlist on top of ``protected_paths``.
         """
         if not diff_text.strip():
             raise UnsafePatchError("empty diff")
-        paths = _paths_from_diff(diff_text)
-        if not paths:
+        files = extract_touched_files(diff_text)
+        if not files:
             raise UnsafePatchError("diff does not name any files")
-        # File-count cap.
-        if len(paths) > self._max_files:
+        if len(files) > self._max_files:
             raise UnsafePatchError(
-                f"too many files ({len(paths)} > {self._max_files})"
+                f"too many files ({len(files)} > {self._max_files})"
             )
-        # Path-safety checks (forbidden globs + protected paths + traversal).
-        for p in paths:
+        for p in files:
             if p.startswith("/") or ".." in Path(p).parts:
                 raise UnsafePatchError(f"non-relative path: {p}")
             if any(fnmatch.fnmatch(p, pat) for pat in FORBIDDEN_GLOBS):
                 raise UnsafePatchError(f"forbidden path: {p}")
             if matches_any_protected(p, self._protected):
                 raise UnsafePatchError(f"protected path: {p}")
-        # Line cap (count added + removed payload lines, ignore headers).
-        changed = _count_changed_lines(diff_text)
-        if changed > self._max_patch_lines:
+        n_lines = count_patch_lines(diff_text)
+        if n_lines > self._max_patch_lines:
             raise UnsafePatchError(
-                f"patch too large ({changed} > {self._max_patch_lines} lines)"
+                f"patch too large ({n_lines} > {self._max_patch_lines} lines)"
             )
-        # Stage diff to a temp file and check + apply.
-        with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as tmp:
-            tmp.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
-            tmp_path = tmp.name
-        try:
-            try:
-                self._git("apply", "--check", tmp_path)
-            except RuntimeError as e:
-                raise UnsafePatchError(f"git apply --check failed: {e}") from e
-            try:
-                self._git("apply", tmp_path)
-            except RuntimeError as e:
-                raise UnsafePatchError(f"git apply failed: {e}") from e
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
+
+        # All guards passed at the class level. Delegate the actual apply
+        # (including the post-apply git diff --check step) to the free
+        # function. Translate False into a generic UnsafePatchError; the
+        # specific reason is in the logs from apply_unified_diff itself.
+        ok = apply_unified_diff(
+            diff_text,
+            repo_root=self._root,
+            protected_paths=self._protected,
+            max_files=self._max_files,
+            max_patch_lines=self._max_patch_lines,
+        )
+        if not ok:
+            raise UnsafePatchError(
+                "git apply or git diff --check failed (see logs for details)"
+            )
         log.info(
             "Applied batched diff for threads %s: %d files",
             thread_ids,
-            len(paths),
+            len(files),
         )
-        return [self._root / p for p in paths]
+        return [self._root / p for p in files]
 
     def apply(self, patch: Patch) -> list[Path]:
         report = self.check_safe(patch)
@@ -165,64 +346,4 @@ class Patcher:
         self._git("checkout", "--", *rel)
 
     def _git(self, *args: str) -> str:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=self._root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"git {' '.join(args)} failed (exit {result.returncode}): "
-                f"{result.stderr.strip()}"
-            )
-        return result.stdout
-
-
-_DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
-_PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(\S+)$", re.MULTILINE)
-# Matches the +++ and --- file header lines in unified diff format.
-# These are exactly three characters followed by a space and a path.
-_HEADER_LINE_RE = re.compile(r"^(?:\+\+\+|---) ")
-
-
-def _paths_from_diff(diff_text: str) -> list[str]:
-    """Extract every repo-relative path touched by a unified diff.
-
-    Returns the **union** of paths from ``diff --git a/X b/Y`` headers and
-    ``+++ b/Y`` lines. ``git apply`` decides target files from the
-    ``---``/``+++`` headers, not from ``diff --git`` — so a malicious /
-    confused diff with mismatched headers (e.g. ``diff --git a/safe.py b/safe.py``
-    but ``+++ b/.github/workflows/ci.yml``) would otherwise pass safety
-    checks against ``safe.py`` while ``git apply`` mutates the workflow
-    file. Validating the union closes that gap.
-    """
-    paths: list[str] = []
-    seen: set[str] = set()
-    for _, b in _DIFF_GIT_RE.findall(diff_text):
-        if b and b != "/dev/null" and b not in seen:
-            paths.append(b)
-            seen.add(b)
-    for b in _PLUS_FILE_RE.findall(diff_text):
-        if b and b != "/dev/null" and b not in seen:
-            paths.append(b)
-            seen.add(b)
-    return paths
-
-
-def _count_changed_lines(diff_text: str) -> int:
-    """Count payload +/- lines, excluding the +++ / --- header rows.
-
-    Header rows are exactly ``+++ <path>`` or ``--- <path>`` (three marker
-    characters followed by a space).  Payload lines that happen to start with
-    ``--`` or ``++`` (e.g. a removed/added line whose content begins with
-    dashes) are still counted.
-    """
-    count = 0
-    for line in diff_text.splitlines():
-        if _HEADER_LINE_RE.match(line):
-            continue
-        if line.startswith(("+", "-")):
-            count += 1
-    return count
+        return _run_git(list(args), cwd=self._root)
