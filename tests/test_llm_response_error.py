@@ -41,6 +41,17 @@ def test_patch_prompt_no_leading_newline_without_pr_context(thread_factory):
     assert out.startswith("Thread path:")
 
 
+def test_parse_classification_handles_null_confidence(thread_factory):
+    """End-to-end regression for the TypeError leak: an LLM reply with
+    ``"confidence": null`` must fall back to NEEDS_HUMAN, not crash."""
+    from pr_agent.llm._base import parse_classification
+
+    raw = '{"category": "AUTO_FIX", "confidence": null, "reason": "x"}'
+    cls = parse_classification(raw, thread_id="T_1")
+    assert cls.category == "NEEDS_HUMAN"
+    assert "failed validation" in cls.reason
+
+
 def test_classify_returns_needs_human_on_truncated_response(monkeypatch, thread_factory):
     """Regression: when the classifier model returns non-JSON, classify must
     fall back to NEEDS_HUMAN instead of letting LLMResponseError escape and

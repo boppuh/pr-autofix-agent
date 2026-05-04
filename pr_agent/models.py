@@ -74,6 +74,13 @@ class Classification:
 
     @classmethod
     def from_json(cls, data: dict[str, Any], thread_id: str) -> Classification:
+        """Build a Classification from a parsed JSON dict.
+
+        Any malformed input (wrong category, non-numeric confidence,
+        ``"confidence": null``, a list / dict where a scalar was expected)
+        raises ``ValueError`` so callers can use a single except clause for
+        all LLM-output validation failures.
+        """
         category = str(data.get("category") or data.get("label") or "").upper()
         # Backwards-compat with the legacy two-bucket schema.
         if category == "AUTO_FIXABLE":
@@ -82,11 +89,17 @@ class Classification:
             category = "NEEDS_HUMAN"
         if category not in _CATEGORY_VALUES:
             raise ValueError(f"Unknown classification category {category!r}")
+        try:
+            confidence = float(data.get("confidence", 0.0))
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"confidence must be numeric, got {data.get('confidence')!r}"
+            ) from e
         return cls(
             thread_id=thread_id,
             category=category,  # type: ignore[arg-type]
             reason=str(data.get("reason", "")),
-            confidence=float(data.get("confidence", 0.0)),
+            confidence=confidence,
         )
 
 
@@ -111,6 +124,11 @@ class Patch:
 
     @classmethod
     def from_json(cls, data: dict[str, Any], thread_id: str) -> Patch:
+        """Build a Patch from a parsed JSON dict.
+
+        Any malformed input raises ``ValueError`` so callers can use a single
+        except clause for all LLM-output validation failures.
+        """
         files_raw = data.get("files") or []
         files: list[PatchFile] = []
         for f in files_raw:
@@ -118,12 +136,13 @@ class Patch:
                 raise ValueError(
                     f"patch file entry must be a mapping, got {type(f).__name__}"
                 )
+            try:
+                path = str(f["path"])
+                new_content = str(f["new_content"])
+            except KeyError as e:
+                raise ValueError(f"patch file missing required field: {e}") from e
             files.append(
-                PatchFile(
-                    path=str(f["path"]),
-                    new_content=str(f["new_content"]),
-                    rationale=str(f.get("rationale", "")),
-                )
+                PatchFile(path=path, new_content=new_content, rationale=str(f.get("rationale", "")))
             )
         return cls(
             thread_id=thread_id,

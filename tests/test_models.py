@@ -80,6 +80,25 @@ def test_classification_from_json_rejects_unknown_value():
         Classification.from_json({"category": "POTATO"}, thread_id="T1")
 
 
+def test_classification_from_json_null_confidence_raises_value_error():
+    """Regression: ``"confidence": null`` from the model used to TypeError out
+    of float(None). It must surface as ValueError so the parse_classification
+    fallback handler (catches LLMResponseError, ValueError) absorbs it."""
+    with pytest.raises(ValueError, match="confidence"):
+        Classification.from_json(
+            {"category": "AUTO_FIX", "confidence": None, "reason": "x"},
+            thread_id="T1",
+        )
+
+
+def test_classification_from_json_list_confidence_raises_value_error():
+    with pytest.raises(ValueError, match="confidence"):
+        Classification.from_json(
+            {"category": "AUTO_FIX", "confidence": [0.9], "reason": "x"},
+            thread_id="T1",
+        )
+
+
 # --- Patch ----------------------------------------------------------------
 
 
