@@ -168,3 +168,20 @@ def test_apply_diff_rejects_diff_that_does_not_apply(git_repo):
     )
     with pytest.raises(UnsafePatchError, match="git apply --check failed"):
         p.apply_diff(diff, thread_ids=["T1"])
+
+
+def test_apply_diff_validates_plus_plus_path_when_diff_git_header_lies(git_repo):
+    """Regression: a malicious / confused diff might claim a safe path in
+    its `diff --git` header but actually target a forbidden path via the
+    `+++ b/` line. `git apply` follows the `+++` line; our safety check
+    must too. The union of both header sources must be validated."""
+    p = _mk(git_repo)
+    # diff --git claims src/foo.py, but +++ targets the workflow file.
+    diff = (
+        "diff --git a/src/foo.py b/src/foo.py\n"
+        "--- a/src/foo.py\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -0,0 +1 @@\n+evil: true\n"
+    )
+    with pytest.raises(UnsafePatchError, match="forbidden path"):
+        p.apply_diff(diff, thread_ids=["T1"])

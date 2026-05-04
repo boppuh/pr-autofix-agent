@@ -182,22 +182,26 @@ _PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(\S+)$", re.MULTILINE)
 
 
 def _paths_from_diff(diff_text: str) -> list[str]:
-    """Extract repo-relative paths touched by a unified diff.
+    """Extract every repo-relative path touched by a unified diff.
 
-    Prefers the b-side of ``diff --git`` headers; falls back to ``+++ b/``
-    lines for diffs that omit the ``diff --git`` preamble.
+    Returns the **union** of paths from ``diff --git a/X b/Y`` headers and
+    ``+++ b/Y`` lines. ``git apply`` decides target files from the
+    ``---``/``+++`` headers, not from ``diff --git`` — so a malicious /
+    confused diff with mismatched headers (e.g. ``diff --git a/safe.py b/safe.py``
+    but ``+++ b/.github/workflows/ci.yml``) would otherwise pass safety
+    checks against ``safe.py`` while ``git apply`` mutates the workflow
+    file. Validating the union closes that gap.
     """
     paths: list[str] = []
     seen: set[str] = set()
     for _, b in _DIFF_GIT_RE.findall(diff_text):
-        if b not in seen:
+        if b and b != "/dev/null" and b not in seen:
             paths.append(b)
             seen.add(b)
-    if not paths:
-        for b in _PLUS_FILE_RE.findall(diff_text):
-            if b not in seen:
-                paths.append(b)
-                seen.add(b)
+    for b in _PLUS_FILE_RE.findall(diff_text):
+        if b and b != "/dev/null" and b not in seen:
+            paths.append(b)
+            seen.add(b)
     return paths
 
 

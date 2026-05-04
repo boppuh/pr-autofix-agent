@@ -192,10 +192,27 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         if diff is not None:
-            for t in live_fixable:
-                state.increment_attempt(t.id)
+            # Dry-run check BEFORE we mutate anything via git apply.
+            if inputs.dry_run:
+                log.info(
+                    "[DRY RUN] would apply batched diff for %d thread(s)",
+                    len(live_fixable),
+                )
+                for t in live_fixable:
+                    state.increment_attempt(t.id)
+                state.record_round(round_result)
+                return 0
             try:
                 applied_paths = patcher.apply_diff(diff, [t.id for t in live_fixable])
+            except UnsafePatchError as e:
+                # Don't increment attempts here — the per-thread fallback below
+                # will increment per thread as it actually consumes attempts.
+                log.info("Batched diff rejected by Patcher (%s); falling back.", e)
+                applied_paths = []
+                patches = []
+            else:
+                for t in live_fixable:
+                    state.increment_attempt(t.id)
                 # Synthesize a single Patch for the commit message + replies.
                 rel_paths = [str(p.relative_to(repo_root)) for p in applied_paths]
                 synthetic = Patch(
@@ -206,10 +223,6 @@ def main(argv: list[str] | None = None) -> int:
                 patches = [(t, synthetic) for t in live_fixable]
                 batch_used = True
                 log.info("Batched patch applied: %d files", len(applied_paths))
-            except UnsafePatchError as e:
-                log.info("Batched diff rejected by Patcher (%s); falling back.", e)
-                applied_paths = []
-                patches = []
 
         # --- Per-thread fallback (Phase 5 path) -----------------------------
         if not batch_used:
@@ -263,15 +276,6 @@ def main(argv: list[str] | None = None) -> int:
 
             for _, patch in patches:
                 applied_paths.extend(patcher.apply(patch))
-
-        if inputs.dry_run and batch_used:
-            log.info(
-                "[DRY RUN] would apply batched diff: %d file(s) for %d thread(s)",
-                len(applied_paths),
-                len(live_fixable),
-            )
-            state.record_round(round_result)
-            return 0
 
         round_result.validation = validator.run()
         if not round_result.validation_ok:
