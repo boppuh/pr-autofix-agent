@@ -7,8 +7,18 @@ deterministic string-building helpers.
 
 from __future__ import annotations
 
-from pr_agent.models import ReviewComment, ReviewThread
-from pr_agent.run import _summarize_human_threads
+from pr_agent.models import (
+    AgentRunReport,
+    CommandResult,
+    EscalatedThread,
+    EscalationReason,
+    HandledThread,
+    ReviewComment,
+    ReviewThread,
+    RoundResult,
+    ValidationResult,
+)
+from pr_agent.run import _format_run_summary, _summarize_human_threads
 
 
 def _thread(thread_id: str, path: str | None, line: int | None) -> ReviewThread:
@@ -67,3 +77,96 @@ def test_summarize_truncates_past_twenty_threads():
     assert "src/19.py" in out
     assert "src/20.py" not in out
     assert "and 5 more" in out
+
+
+# --- _format_run_summary (Phase 13) -------------------------------------
+
+
+def test_format_run_summary_empty_when_no_rounds():
+    report = AgentRunReport(pr_number=42)
+    assert _format_run_summary(report) == ""
+
+
+def test_format_run_summary_single_round_full():
+    report = AgentRunReport(pr_number=42)
+    report.rounds.append(
+        RoundResult(
+            round_no=1,
+            handled=[
+                HandledThread(thread_id="T1", location="src/foo.ts:42",
+                              summary="added null guard"),
+                HandledThread(thread_id="T2", location="src/bar.ts:18",
+                              summary="fixed incorrect type"),
+            ],
+            validation=ValidationResult(
+                success=True,
+                command_results=[
+                    CommandResult(name="npm test", ok=True, exit_code=0),
+                    CommandResult(name="npm run lint", ok=True, exit_code=0),
+                    CommandResult(name="npm run typecheck", ok=True, exit_code=0),
+                ],
+            ),
+            escalated_to_human=[
+                EscalatedThread(thread_id="T3", location="src/auth/session.ts:120",
+                                reason="rule: needs-human keyword 'auth'"),
+            ],
+        )
+    )
+    out = _format_run_summary(report)
+    assert "## PR Autofix Agent — Run Summary" in out
+    assert "### Round 1" in out
+    # Handled section.
+    assert "Handled:" in out
+    assert "`src/foo.ts:42` — added null guard" in out
+    assert "`src/bar.ts:18` — fixed incorrect type" in out
+    # Validation section.
+    assert "Validation:" in out
+    assert "npm test: passed" in out
+    assert "npm run lint: passed" in out
+    assert "npm run typecheck: passed" in out
+    # Escalated section.
+    assert "Escalated:" in out
+    assert "`src/auth/session.ts:120` — rule: needs-human keyword 'auth'" in out
+
+
+def test_format_run_summary_validation_failure_status():
+    report = AgentRunReport(pr_number=1)
+    report.rounds.append(
+        RoundResult(
+            round_no=1,
+            validation=ValidationResult(
+                success=False,
+                command_results=[
+                    CommandResult(name="pytest", ok=False, exit_code=1,
+                                  stderr_tail="F401"),
+                ],
+            ),
+        )
+    )
+    out = _format_run_summary(report)
+    assert "pytest: failed (exit 1)" in out
+
+
+def test_format_run_summary_multi_round_with_empty_round():
+    report = AgentRunReport(pr_number=1)
+    report.rounds.append(
+        RoundResult(
+            round_no=1,
+            handled=[HandledThread(thread_id="T1", location="x.py:1", summary="fix")],
+        )
+    )
+    report.rounds.append(RoundResult(round_no=2))  # no actions
+    out = _format_run_summary(report)
+    assert "### Round 1" in out
+    assert "### Round 2" in out
+    assert "(no actions taken this round)" in out
+
+
+def test_format_run_summary_includes_escalation_footer():
+    report = AgentRunReport(pr_number=1)
+    report.rounds.append(RoundResult(round_no=1))
+    report.escalated = True
+    report.escalation_reason = EscalationReason.MAX_ROUNDS
+    report.final_unresolved_thread_ids = ["T1", "T2", "T3"]
+    out = _format_run_summary(report)
+    assert "Final status: escalated (`max_rounds`) — 3 unresolved thread(s)." in out

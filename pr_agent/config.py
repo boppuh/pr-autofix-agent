@@ -77,6 +77,9 @@ def load_target_repo_config(repo_root: Path) -> TargetRepoConfig:
         exit_on_validation_failure=bool(
             safety_raw.get("exit_on_validation_failure", True)
         ),
+        post_per_thread_replies=bool(
+            safety_raw.get("post_per_thread_replies", True)
+        ),
     )
 
     protected_raw = raw.get("protected_paths")

@@ -193,10 +193,37 @@ class ValidationResult:
 
 
 @dataclass
+class HandledThread:
+    """A thread the agent successfully fixed in a given round.
+
+    Used by the end-of-run summary comment to render the 'Handled:' section.
+    """
+
+    thread_id: str
+    location: str  # e.g. "src/foo.py:42" or "(no path)"
+    summary: str  # the LLM's per-patch summary line
+
+
+@dataclass
+class EscalatedThread:
+    """A thread routed to NEEDS_HUMAN by triage in a given round.
+
+    Used by the end-of-run summary comment to render the 'Escalated:' section.
+    Distinct from IGNORE / dedupe / LLM-error skips, which are not surfaced.
+    """
+
+    thread_id: str
+    location: str
+    reason: str  # rule keyword or LLM reason
+
+
+@dataclass
 class RoundResult:
     round_no: int
     fixed_thread_ids: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    handled: list[HandledThread] = field(default_factory=list)
+    escalated_to_human: list[EscalatedThread] = field(default_factory=list)
     validation: ValidationResult = field(
         default_factory=lambda: ValidationResult(success=True)
     )
@@ -277,6 +304,7 @@ class SafetyLimits:
     max_files_touched: int = 15
     max_runtime_minutes: int = 20
     exit_on_validation_failure: bool = True
+    post_per_thread_replies: bool = True
 
 
 @dataclass

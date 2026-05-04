@@ -149,3 +149,25 @@ def test_workflow_inputs_defaults():
     assert w.model is None
     assert w.confidence_threshold == 0.7
     assert w.log_level == "INFO"
+
+
+# --- Phase 13: HandledThread / EscalatedThread / RoundResult fields -----
+
+
+def test_round_result_defaults_handled_and_escalated_empty():
+    from pr_agent.models import RoundResult
+
+    r = RoundResult(round_no=1)
+    assert r.handled == []
+    assert r.escalated_to_human == []
+
+
+def test_handled_and_escalated_thread_round_trip_through_asdict():
+    from dataclasses import asdict
+
+    from pr_agent.models import EscalatedThread, HandledThread
+
+    h = HandledThread(thread_id="T1", location="src/foo.py:42", summary="fix null")
+    e = EscalatedThread(thread_id="T2", location="src/auth/session.py", reason="auth")
+    assert asdict(h) == {"thread_id": "T1", "location": "src/foo.py:42", "summary": "fix null"}
+    assert asdict(e) == {"thread_id": "T2", "location": "src/auth/session.py", "reason": "auth"}

@@ -62,6 +62,23 @@ def test_safety_exit_on_validation_failure_can_be_disabled(tmp_path):
     assert cfg.safety.max_rounds == MAX_ROUNDS
 
 
+def test_safety_post_per_thread_replies_default_and_override(tmp_path):
+    """Phase 13 toggle defaults to True; YAML override to false works."""
+    cfg = load_target_repo_config(tmp_path)
+    assert cfg.safety.post_per_thread_replies is True
+
+    (tmp_path / ".pr-agent.yml").write_text(
+        textwrap.dedent(
+            """
+            safety:
+              post_per_thread_replies: false
+            """
+        )
+    )
+    cfg2 = load_target_repo_config(tmp_path)
+    assert cfg2.safety.post_per_thread_replies is False
+
+
 def test_empty_lists_are_respected(tmp_path):
     """Explicitly empty lists must not silently fall back to defaults."""
     (tmp_path / ".pr-agent.yml").write_text(
