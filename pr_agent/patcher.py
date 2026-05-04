@@ -131,6 +131,110 @@ def _path_from_match(plain: str, quoted: str) -> str:
     return plain if plain else _decode_quoted_inner(quoted)
 
 
+# --- Single diff tokenizer -----------------------------------------------
+#
+# Every diff-introspection function in this module reads off the same
+# per-file token stream: paths from headers, +/- payload counts from
+# inside hunks. Keeping one walker means every parser sees the same view
+# — no class of bug where ``count_patch_lines`` and
+# ``extract_touched_files`` disagree about what is a header vs. payload.
+
+
+@dataclass(frozen=True)
+class FileSection:
+    """One file's worth of a unified diff.
+
+    ``a_paths`` and ``b_paths`` are kept ordered (insertion order) and
+    are the union of the ``diff --git`` header sides and the
+    corresponding ``--- a/X`` / ``+++ b/Y`` rows that appear before the
+    first ``@@`` for this file. ``payload_lines`` counts ``+`` and ``-``
+    rows inside ``@@`` hunks for this file only.
+    """
+
+    a_paths: tuple[str, ...]
+    b_paths: tuple[str, ...]
+    payload_lines: int
+
+
+def _iter_diff_sections(diff_text: str) -> list[FileSection]:
+    """Walk a unified diff once and emit per-file sections.
+
+    Designed to be the single source of truth for diff parsing in this
+    module. Behavior:
+
+    - A ``diff --git`` line opens a new section. If a section was being
+      built, it is closed and emitted first.
+    - Inside the file header (between ``diff --git`` / start-of-input
+      and the first ``@@``), ``--- a/X`` and ``+++ b/Y`` rows contribute
+      paths.
+    - The first ``@@`` line in a file flips to hunk mode; ``+`` / ``-``
+      rows from that point until the next ``diff --git`` (or EOF) are
+      counted as payload.
+    - A diff that lacks any ``diff --git`` header (plain ``--- a/x`` /
+      ``+++ b/x``) is treated as one anonymous section; the in-header
+      default is True so the leading ``+++`` row is still a header.
+    - ``/dev/null`` paths are dropped from both sides.
+    """
+    sections: list[FileSection] = []
+    a_paths: list[str] = []
+    b_paths: list[str] = []
+    payload_lines = 0
+    in_header = True
+    started = False  # True once we have any content for a section
+
+    def _add(seq: list[str], path: str) -> None:
+        if path and path != "/dev/null" and path not in seq:
+            seq.append(path)
+
+    def _flush() -> None:
+        nonlocal a_paths, b_paths, payload_lines, started
+        if not started:
+            return
+        sections.append(
+            FileSection(
+                a_paths=tuple(a_paths),
+                b_paths=tuple(b_paths),
+                payload_lines=payload_lines,
+            )
+        )
+        a_paths = []
+        b_paths = []
+        payload_lines = 0
+        started = False
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            _flush()
+            started = True
+            in_header = True
+            m = _DIFF_GIT_RE.match(line)
+            if m:
+                _add(a_paths, _path_from_match(m.group(1), m.group(2)))
+                _add(b_paths, _path_from_match(m.group(3), m.group(4)))
+            continue
+        if line.startswith("@@"):
+            in_header = False
+            started = True
+            continue
+        if in_header and line.startswith("+++ "):
+            started = True
+            mp = _PLUS_HEADER_RE.match(line)
+            if mp:
+                _add(b_paths, _path_from_match(mp.group(1), mp.group(2)))
+            continue
+        if in_header and line.startswith("--- "):
+            started = True
+            mm = _MINUS_HEADER_RE.match(line)
+            if mm:
+                _add(a_paths, _path_from_match(mm.group(1), mm.group(2)))
+            continue
+        if not in_header and line.startswith(("+", "-")):
+            payload_lines += 1
+            started = True
+    _flush()
+    return sections
+
+
 def extract_touched_files(diff_text: str) -> list[str]:
     """Every repo-relative path the diff names.
 
@@ -148,79 +252,35 @@ def extract_touched_files(diff_text: str) -> list[str]:
 
     Handles git's quoted-path form (``"b/path with spaces.py"``) so a
     diff targeting a protected path that git happens to quote can't slip
-    past the safety guards.
-
-    Uses a small state machine instead of a global multiline regex: a
-    payload addition line whose content begins with ``++ b/...`` would
-    render in the diff as ``+++ b/...``, indistinguishable from a real
-    file header without context. Only the ``+++`` / ``---`` lines that
-    appear in file-header position (between ``diff --git`` and the
-    first ``@@`` of that file) are treated as headers.
+    past the safety guards. Reads off the shared
+    :func:`_iter_diff_sections` walker so payload lines beginning with
+    ``+++ b/...`` or ``--- a/...`` (which would otherwise look like
+    headers) are correctly classified as content.
     """
-    paths: list[str] = []
     seen: set[str] = set()
-
-    def _add(path: str) -> None:
-        if path and path != "/dev/null" and path not in seen:
-            paths.append(path)
-            seen.add(path)
-
-    # Default to in-header so a diff that lacks a ``diff --git`` line
-    # (e.g. plain ``--- a/x``/``+++ b/x``) still has its ``+++`` row
-    # recognised as a header before any ``@@`` switches to payload mode.
-    in_header = True
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            in_header = True
-            m = _DIFF_GIT_RE.match(line)
-            if m:
-                # Both a-side (source) and b-side (destination): a rename
-                # diff lists distinct paths and a protected source must
-                # still trigger the guard.
-                _add(_path_from_match(m.group(1), m.group(2)))
-                _add(_path_from_match(m.group(3), m.group(4)))
-            continue
-        if line.startswith("@@"):
-            in_header = False
-            continue
-        if in_header and line.startswith("+++ "):
-            mp = _PLUS_HEADER_RE.match(line)
-            if mp:
-                _add(_path_from_match(mp.group(1), mp.group(2)))
-        elif in_header and line.startswith("--- "):
-            mm = _MINUS_HEADER_RE.match(line)
-            if mm:
-                _add(_path_from_match(mm.group(1), mm.group(2)))
+    paths: list[str] = []
+    # Within a section, a-side first then b-side — matches the prior
+    # walker's emission order (the ``diff --git`` header lists a/ before
+    # b/).
+    for section in _iter_diff_sections(diff_text):
+        for p in (*section.a_paths, *section.b_paths):
+            if p not in seen:
+                seen.add(p)
+                paths.append(p)
     return paths
 
 
 def count_patch_lines(diff_text: str) -> int:
-    """Count payload +/- lines, excluding the ``+++`` / ``---`` header rows.
+    """Count payload ``+``/``-`` lines across all hunks.
 
-    Uses a small state machine: the file-header rows ``--- <path>`` and
-    ``+++ <path>`` only ever appear *before* the first ``@@`` hunk marker
-    of a file. Once we've entered a hunk, every line beginning with ``+``
-    or ``-`` is payload — including a removed line whose content happens
-    to start with ``-- `` (which appears in the diff as ``--- <content>``,
-    indistinguishable from a header by regex alone).
+    The ``--- <path>`` and ``+++ <path>`` rows that wrap each file's
+    hunks are *not* payload; they are file-headers and excluded. A
+    removed line whose content happens to start with ``-- `` (which
+    appears in the diff as ``--- <content>``) IS payload — the shared
+    walker distinguishes header from hunk-content by position, not by
+    regex on the line.
     """
-    count = 0
-    in_hunk = False
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            # New file: reset the state machine so the next file's
-            # ---/+++ header rows are skipped, not counted as payload.
-            in_hunk = False
-            continue
-        if line.startswith("@@"):
-            in_hunk = True
-            continue
-        if not in_hunk:
-            # File-header territory (index, ---/+++ paths, etc.)
-            continue
-        if line.startswith(("+", "-")):
-            count += 1
-    return count
+    return sum(s.payload_lines for s in _iter_diff_sections(diff_text))
 
 
 def violates_protected_paths(files: list[str], protected_paths: list[str]) -> bool:
