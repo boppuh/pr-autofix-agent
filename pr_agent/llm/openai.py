@@ -63,7 +63,7 @@ class OpenAIProvider:
             system=PATCH_SYSTEM,
             user=user,
             cache_key="pr-agent/patch",
-            max_output_tokens=4000,
+            max_output_tokens=16000,
         )
         return parse_patch(text, thread.id)
 

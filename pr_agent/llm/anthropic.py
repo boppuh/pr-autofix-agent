@@ -53,7 +53,9 @@ class AnthropicProvider:
             pr_body_excerpt=pr_body_excerpt,
             pr_diff_excerpt=pr_diff_excerpt,
         )
-        text = self._call(system=PATCH_SYSTEM, user=user, max_tokens=4000)
+        # Full file contents need headroom; 4000 was hitting truncation on
+        # real-sized source files (then crashing patch JSON parsing).
+        text = self._call(system=PATCH_SYSTEM, user=user, max_tokens=16000)
         return parse_patch(text, thread.id)
 
     def _call(self, *, system: str, user: str, max_tokens: int) -> str:
