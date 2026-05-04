@@ -12,11 +12,16 @@ on:
         required: false
         type: number
         default: 5
-      model:
-        description: Anthropic model id
+      provider:
+        description: LLM provider — anthropic or openai
         required: false
         type: string
-        default: claude-sonnet-4-6
+        default: anthropic
+      model:
+        description: Provider-specific model id (defaults to claude-sonnet-4-6 / gpt-5-codex)
+        required: false
+        type: string
+        default: ""
       dry_run:
         description: If true, generate patches but do not commit/push
         required: false
@@ -34,7 +39,9 @@ on:
         default: 0.7
     secrets:
       ANTHROPIC_API_KEY:
-        required: true
+        required: false
+      OPENAI_API_KEY:
+        required: false
 
 permissions:
   contents: write
@@ -86,9 +93,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
           MAX_ROUNDS: ${{ inputs.max_rounds }}
+          AGENT_PROVIDER: ${{ inputs.provider }}
           AGENT_MODEL: ${{ inputs.model }}
           DRY_RUN: ${{ inputs.dry_run }}
           NEEDS_HUMAN_LABEL: ${{ inputs.needs_human_label }}
@@ -101,5 +110,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-autofix-state-${{ inputs.pr_number }}
-          path: pr_agent_state.json
+          path: .pr-agent-state.json
           if-no-files-found: ignore

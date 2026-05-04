@@ -6,4 +6,6 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 pr_agent_state.json
+.pr-agent-state.json
+.pr-agent-state.json.tmp
 .DS_Store

@@ -1,57 +1,120 @@
+"""Domain models — pure stdlib dataclasses, no pydantic.
+
+Each call site that used to lean on pydantic validation gets an explicit
+`from_*` factory or normaliser here.
+"""
+
 from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, Field
+# --- Review thread ---------------------------------------------------------
 
 
-class BugbotComment(BaseModel):
+@dataclass
+class ReviewComment:
     id: str
-    author_login: str
+    author: str
     body: str
-    path: str | None = None
-    line: int | None = None
-    created_at: datetime
+    path: str | None
+    line: int | None
+    diff_hunk: str | None
+    created_at: str
 
 
-class ReviewThread(BaseModel):
+@dataclass
+class ReviewThread:
     id: str
-    path: str | None = None
-    line: int | None = None
-    is_resolved: bool = False
-    is_outdated: bool = False
-    comments: list[BugbotComment] = Field(default_factory=list)
+    is_resolved: bool
+    comments: list[ReviewComment]
 
     @property
-    def root_comment(self) -> BugbotComment:
+    def root_comment(self) -> ReviewComment:
         return self.comments[0]
 
     @property
     def body_text(self) -> str:
         return "\n\n".join(c.body for c in self.comments)
 
+    @property
+    def path(self) -> str | None:
+        """Convenience: the path of the root comment."""
+        return self.comments[0].path if self.comments else None
 
-class ClassificationLabel(StrEnum):
-    AUTO_FIXABLE = "auto_fixable"
-    HUMAN_REQUIRED = "human_required"
+    @property
+    def line(self) -> int | None:
+        """Convenience: the line of the root comment."""
+        return self.comments[0].line if self.comments else None
 
 
-class Classification(BaseModel):
-    label: ClassificationLabel
-    confidence: float = Field(ge=0.0, le=1.0)
+# --- Classification --------------------------------------------------------
+
+ClassificationCategory = Literal["AUTO_FIX", "NEEDS_HUMAN", "IGNORE"]
+_CATEGORY_VALUES: tuple[str, ...] = get_args(ClassificationCategory)
+
+
+@dataclass
+class Classification:
+    thread_id: str
+    category: ClassificationCategory
     reason: str
-    skipped_by_rule: str | None = None
+    confidence: float
+
+    def __post_init__(self) -> None:
+        if self.category not in _CATEGORY_VALUES:
+            raise ValueError(
+                f"Classification.category must be one of {_CATEGORY_VALUES}, got {self.category!r}"
+            )
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError(
+                f"Classification.confidence must be in [0,1], got {self.confidence}"
+            )
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any], thread_id: str) -> Classification:
+        """Build a Classification from a parsed JSON dict.
+
+        Any malformed input (wrong category, non-numeric confidence,
+        ``"confidence": null``, a list / dict where a scalar was expected)
+        raises ``ValueError`` so callers can use a single except clause for
+        all LLM-output validation failures.
+        """
+        category = str(data.get("category") or data.get("label") or "").upper()
+        # Backwards-compat with the legacy two-bucket schema.
+        if category == "AUTO_FIXABLE":
+            category = "AUTO_FIX"
+        elif category == "HUMAN_REQUIRED":
+            category = "NEEDS_HUMAN"
+        if category not in _CATEGORY_VALUES:
+            raise ValueError(f"Unknown classification category {category!r}")
+        try:
+            confidence = float(data.get("confidence", 0.0))
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"confidence must be numeric, got {data.get('confidence')!r}"
+            ) from e
+        return cls(
+            thread_id=thread_id,
+            category=category,  # type: ignore[arg-type]
+            reason=str(data.get("reason", "")),
+            confidence=confidence,
+        )
 
 
-class PatchFile(BaseModel):
+# --- Patches ---------------------------------------------------------------
+
+
+@dataclass
+class PatchFile:
     path: str
     new_content: str
     rationale: str
 
 
-class Patch(BaseModel):
+@dataclass
+class Patch:
     thread_id: str
     files: list[PatchFile]
     summary: str
@@ -59,8 +122,46 @@ class Patch(BaseModel):
     def touched_paths(self) -> list[str]:
         return [f.path for f in self.files]
 
+    @classmethod
+    def from_json(cls, data: dict[str, Any], thread_id: str) -> Patch:
+        """Build a Patch from a parsed JSON dict.
 
-class ValidationResult(BaseModel):
+        Any malformed input raises ``ValueError`` so callers can use a single
+        except clause for all LLM-output validation failures.
+        """
+        files_raw = data.get("files") or []
+        files: list[PatchFile] = []
+        for f in files_raw:
+            if not isinstance(f, dict):
+                raise ValueError(
+                    f"patch file entry must be a mapping, got {type(f).__name__}"
+                )
+            try:
+                path = str(f["path"])
+                new_content = str(f["new_content"])
+            except KeyError as e:
+                raise ValueError(f"patch file missing required field: {e}") from e
+            files.append(
+                PatchFile(path=path, new_content=new_content, rationale=str(f.get("rationale", "")))
+            )
+        return cls(
+            thread_id=thread_id,
+            files=files,
+            summary=str(data.get("summary", "autofix")),
+        )
+
+
+# --- Validation ------------------------------------------------------------
+
+
+@dataclass
+class ValidateCommand:
+    name: str
+    run: str
+
+
+@dataclass
+class ValidationResult:
     name: str
     ok: bool
     exit_code: int
@@ -69,11 +170,15 @@ class ValidationResult(BaseModel):
     duration_s: float = 0.0
 
 
-class RoundResult(BaseModel):
+# --- Round / report --------------------------------------------------------
+
+
+@dataclass
+class RoundResult:
     round_no: int
-    fixed_thread_ids: list[str] = Field(default_factory=list)
-    skipped: list[tuple[str, str]] = Field(default_factory=list)
-    validation: list[ValidationResult] = Field(default_factory=list)
+    fixed_thread_ids: list[str] = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+    validation: list[ValidationResult] = field(default_factory=list)
     commit_sha: str | None = None
     error: str | None = None
 
@@ -89,22 +194,61 @@ class EscalationReason(StrEnum):
     UNSAFE_PATCH = "unsafe_patch"
     RUNTIME_BUDGET_EXHAUSTED = "runtime_budget_exhausted"
     MISSING_LLM_CREDENTIAL = "missing_llm_credential"
+    NO_PROGRESS = "no_progress"
 
 
-class AgentRunReport(BaseModel):
+@dataclass(kw_only=True)
+class AgentRunReport:
+    """Persisted state for a single agent run.
+
+    The first four fields are the spec surface for `.pr-agent-state.json`:
+    `round`, `processed_comment_hashes`, `thread_attempt_counts`,
+    `previous_unresolved_count`. The rest is the audit trail kept for
+    debugging and the escalation comment.
+
+    `kw_only=True` lets us put the spec fields (with defaults) before the
+    required `pr_number` field; `dataclasses.asdict` then serialises them
+    in that order at the top of the JSON file.
+    """
+
+    round: int = 0
+    processed_comment_hashes: list[str] = field(default_factory=list)
+    thread_attempt_counts: dict[str, int] = field(default_factory=dict)
+    previous_unresolved_count: int | None = None
     pr_number: int
-    rounds: list[RoundResult] = Field(default_factory=list)
     escalated: bool = False
     escalation_reason: EscalationReason | None = None
-    final_unresolved_thread_ids: list[str] = Field(default_factory=list)
+    final_unresolved_thread_ids: list[str] = field(default_factory=list)
+    rounds: list[RoundResult] = field(default_factory=list)
 
 
-class ValidateCommand(BaseModel):
+# --- PR + checks -----------------------------------------------------------
+
+
+@dataclass
+class PullRequest:
+    id: str
+    number: int
+    title: str
+    body: str
+    head_ref_name: str
+    head_ref_oid: str
+    base_ref_name: str
+    threads: list[ReviewThread] = field(default_factory=list)
+
+
+@dataclass
+class CheckRun:
     name: str
-    run: str
+    status: str  # queued | in_progress | completed
+    conclusion: str | None = None  # success | failure | neutral | cancelled | timed_out | ...
 
 
-class SafetyLimits(BaseModel):
+# --- Config ----------------------------------------------------------------
+
+
+@dataclass
+class SafetyLimits:
     max_rounds: int = 5
     max_comments_per_round: int = 20
     max_patch_lines: int = 800
@@ -112,23 +256,42 @@ class SafetyLimits(BaseModel):
     max_runtime_minutes: int = 20
 
 
-class TargetRepoConfig(BaseModel):
+@dataclass
+class TargetRepoConfig:
     """Schema for the target repo's `.pr-agent.yml`."""
 
-    validate_: list[ValidateCommand] = Field(default_factory=list, alias="validate")
-    protected_paths: list[str] = Field(default_factory=list)
-    safety: SafetyLimits = Field(default_factory=SafetyLimits)
-    bugbot_logins: list[str] = Field(default_factory=lambda: ["cursor", "bugbot", "cursor-bugbot"])
+    validate_: list[ValidateCommand] = field(default_factory=list)
+    protected_paths: list[str] = field(default_factory=list)
+    safety: SafetyLimits = field(default_factory=SafetyLimits)
+    bugbot_logins: list[str] = field(
+        default_factory=lambda: ["cursor", "bugbot", "cursor-bugbot"]
+    )
 
-    model_config = {"populate_by_name": True}
+
+# --- Workflow inputs -------------------------------------------------------
+
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+_LOG_LEVELS: tuple[str, ...] = get_args(LogLevel)
+ProviderName = Literal["anthropic", "openai"]
+_PROVIDERS: tuple[str, ...] = get_args(ProviderName)
 
 
-class WorkflowInputs(BaseModel):
+@dataclass
+class WorkflowInputs:
     pr_number: int
-    max_rounds: int = 5
-    model: str = "claude-sonnet-4-6"
-    dry_run: bool = False
     repo_full_name: str
+    max_rounds: int = 5
+    provider: ProviderName = "anthropic"
+    model: str | None = None
+    dry_run: bool = False
     needs_human_label: str = "needs-human"
     confidence_threshold: float = 0.7
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    log_level: LogLevel = "INFO"
+
+    def __post_init__(self) -> None:
+        if self.provider not in _PROVIDERS:
+            raise ValueError(f"provider must be one of {_PROVIDERS}, got {self.provider!r}")
+        if self.log_level not in _LOG_LEVELS:
+            raise ValueError(
+                f"log_level must be one of {_LOG_LEVELS}, got {self.log_level!r}"
+            )

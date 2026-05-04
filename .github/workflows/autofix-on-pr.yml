@@ -60,7 +60,12 @@ jobs:
       - name: Run agent
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Set whichever provider you're using; the agent reads only the one it needs.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Override via repo variable AGENT_PROVIDER (anthropic|openai); default anthropic.
+          AGENT_PROVIDER: ${{ vars.AGENT_PROVIDER || 'anthropic' }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}
           GIT_AUTHOR_EMAIL: pr-autofix-agent@users.noreply.github.com
         run: |
           python -m pr_agent.run \
@@ -72,5 +77,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-autofix-state-${{ steps.pr.outputs.pr_number }}
-          path: pr_agent_state.json
+          path: .pr-agent-state.json
           if-no-files-found: ignore

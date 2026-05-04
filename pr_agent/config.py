@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
-from pydantic import ValidationError
 
 from .models import SafetyLimits, TargetRepoConfig, ValidateCommand, WorkflowInputs
 
@@ -87,15 +86,13 @@ def load_target_repo_config(repo_root: Path) -> TargetRepoConfig:
     )
 
     try:
-        return TargetRepoConfig.model_validate(
-            {
-                "validate": commands,
-                "protected_paths": protected,
-                "safety": safety,
-                "bugbot_logins": bugbot_logins,
-            }
+        return TargetRepoConfig(
+            validate_=commands,
+            protected_paths=protected,
+            safety=safety,
+            bugbot_logins=bugbot_logins,
         )
-    except ValidationError as e:
+    except (TypeError, ValueError) as e:
         raise ConfigError(f"Invalid {DEFAULT_CONFIG_FILENAME}: {e}") from e
 
 
@@ -111,6 +108,7 @@ def load_workflow_inputs(argv: list[str] | None = None) -> WorkflowInputs:
     parser = argparse.ArgumentParser(prog="pr-autofix-agent")
     parser.add_argument("--pr", dest="pr_number", type=int, required=False)
     parser.add_argument("--max-rounds", type=int, default=None)
+    parser.add_argument("--provider", choices=["anthropic", "openai"], default=None)
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--repo", dest="repo_full_name", type=str, default=None)
@@ -127,10 +125,17 @@ def load_workflow_inputs(argv: list[str] | None = None) -> WorkflowInputs:
     if not repo:
         raise ConfigError("Repo full name required (--repo or GITHUB_REPOSITORY env).")
 
+    provider = (
+        args.provider or os.environ.get("AGENT_PROVIDER") or "anthropic"
+    ).lower()
+    if provider not in {"anthropic", "openai"}:
+        raise ConfigError(f"Invalid provider {provider!r}; must be 'anthropic' or 'openai'.")
+
     return WorkflowInputs(
         pr_number=pr_number,
         max_rounds=args.max_rounds or _int_env("MAX_ROUNDS") or MAX_ROUNDS,
-        model=args.model or os.environ.get("AGENT_MODEL") or "claude-sonnet-4-6",
+        provider=provider,  # type: ignore[arg-type]
+        model=args.model or os.environ.get("AGENT_MODEL") or None,
         dry_run=args.dry_run or _bool_env("DRY_RUN"),
         repo_full_name=repo,
         needs_human_label=args.needs_human_label

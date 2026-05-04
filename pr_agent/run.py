@@ -9,7 +9,8 @@ from pathlib import Path
 from .classifier import Classifier
 from .config import ConfigError, load_target_repo_config, load_workflow_inputs, require_env
 from .github_client import GitHubClient
-from .llm_client import LLMClient
+from .llm import LLMResponseError, make_provider
+from .llm._factory import default_model_for, env_var_for
 from .models import (
     EscalationReason,
     Patch,
@@ -36,29 +37,33 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd()).resolve()
     repo_cfg = load_target_repo_config(repo_root)
 
-    state_path = repo_root / "pr_agent_state.json"
+    state_path = repo_root / ".pr-agent-state.json"
     state = AgentState(inputs.pr_number, persist_path=state_path)
 
     gh_token = require_env("GITHUB_TOKEN")
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    provider_env = env_var_for(inputs.provider)
+    llm_key = os.environ.get(provider_env)
+    model = inputs.model or default_model_for(inputs.provider)
 
     safety = repo_cfg.safety
     max_rounds = min(inputs.max_rounds, safety.max_rounds)
     runtime_deadline = time.monotonic() + safety.max_runtime_minutes * 60
 
-    gh = GitHubClient(gh_token, inputs.repo_full_name, repo_cfg.bugbot_logins)
+    gh = GitHubClient.from_full_name(gh_token, inputs.repo_full_name)
 
     # Short-circuit before constructing any LLM-dependent component, so the
-    # Anthropic SDK is never instantiated without a key (defense in depth:
-    # current SDK versions defer key validation to first request, but future
-    # versions may raise at construction).
-    if not anthropic_key:
-        threads = gh.list_unresolved_bugbot_threads(inputs.pr_number)
+    # provider SDK is never instantiated without a key (defense in depth:
+    # current SDKs defer key validation to first request, but future versions
+    # may raise at construction).
+    if not llm_key:
+        threads = gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)
         if threads:
             log.warning(
-                "ANTHROPIC_API_KEY is not set; cannot triage %d Bugbot thread(s). "
+                "%s is not set; cannot triage %d Bugbot thread(s) with provider=%s. "
                 "Escalating without LLM calls.",
+                provider_env,
                 len(threads),
+                inputs.provider,
             )
             _escalate(
                 gh,
@@ -68,11 +73,14 @@ def main(argv: list[str] | None = None) -> int:
                 [t.id for t in threads],
             )
         else:
-            log.info("ANTHROPIC_API_KEY is not set, but no Bugbot threads to triage. Done.")
+            log.info(
+                "%s is not set, but no Bugbot threads to triage. Done.", provider_env
+            )
         gh.close()
         return 0
 
-    llm = LLMClient(model=inputs.model, api_key=anthropic_key)
+    log.info("Using LLM provider=%s model=%s", inputs.provider, model)
+    llm = make_provider(inputs.provider, model=model, api_key=llm_key)
     classifier = Classifier(
         llm=llm,
         protected_paths=repo_cfg.protected_paths,
@@ -86,23 +94,38 @@ def main(argv: list[str] | None = None) -> int:
     )
     validator = Validator(repo_root=repo_root, commands=repo_cfg.validate_)
 
-    pr = gh.get_pull(inputs.pr_number)
-    head_ref = pr.head.ref
+    pr = gh.get_pr(inputs.pr_number)
+    head_ref = pr.head_ref_name
+    pr_diff = gh.get_pr_diff(inputs.pr_number)
     last_failure: str | None = None
 
     for round_no in range(1, max_rounds + 1):
         if time.monotonic() > runtime_deadline:
             log.warning("Runtime budget (%dm) exhausted.", safety.max_runtime_minutes)
-            unresolved = [t.id for t in gh.list_unresolved_bugbot_threads(inputs.pr_number)]
+            unresolved = [t.id for t in gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)]
             _escalate(gh, inputs, state, EscalationReason.RUNTIME_BUDGET_EXHAUSTED, unresolved)
             gh.close()
             return 0
 
         log.info("=== round %d/%d ===", round_no, max_rounds)
-        threads = gh.list_unresolved_bugbot_threads(inputs.pr_number)
+        threads = gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)
         if not threads:
             log.info("No unresolved Bugbot threads. Done.")
             break
+
+        # Stop-on-no-progress guard: from round 2 onward, escalate if the
+        # unresolved count didn't decrease since the previous round.
+        if not state.start_round(len(threads)):
+            _escalate(
+                gh,
+                inputs,
+                state,
+                EscalationReason.NO_PROGRESS,
+                [t.id for t in threads],
+            )
+            gh.close()
+            return 0
+
         if len(threads) > safety.max_comments_per_round:
             log.info(
                 "Capping %d threads to max_comments_per_round=%d",
@@ -114,7 +137,10 @@ def main(argv: list[str] | None = None) -> int:
         excerpts = _gather_excerpts(gh, threads, head_ref)
         triage = classifier.triage(threads, excerpts)
         round_result = RoundResult(round_no=round_no)
+        # NEEDS_HUMAN threads are tracked as skipped (they keep the PR labelled
+        # for review). IGNORE threads are recorded but won't drive escalation.
         round_result.skipped.extend((t.id, r) for t, r in triage.skipped)
+        round_result.skipped.extend((t.id, r) for t, r in triage.ignored)
 
         if not triage.fixable:
             log.info("No auto-fixable threads remaining.")
@@ -123,16 +149,31 @@ def main(argv: list[str] | None = None) -> int:
 
         patches: list[tuple[ReviewThread, Patch]] = []
         for thread in triage.fixable:
-            if state.already_handled(thread.id, thread.body_text):
-                round_result.skipped.append((thread.id, "already handled"))
+            if state.already_processed(thread.root_comment):
+                round_result.skipped.append((thread.id, "already processed (dedupe)"))
                 continue
             file_contents = _collect_file_contents(repo_root, thread)
-            patch = llm.propose_patch(
-                thread=thread,
-                file_contents=file_contents,
-                max_files=safety.max_files_touched,
-                prior_failure=last_failure,
-            )
+            attempt_no = state.increment_attempt(thread.id)
+            log.info("Thread %s: attempt #%d", thread.id, attempt_no)
+            try:
+                patch = llm.propose_patch(
+                    thread=thread,
+                    file_contents=file_contents,
+                    max_files=safety.max_files_touched,
+                    prior_failure=last_failure,
+                    pr_title=pr.title,
+                    pr_body_excerpt=pr.body[:2000] if pr.body else None,
+                    pr_diff_excerpt=pr_diff,
+                )
+            except LLMResponseError as e:
+                # Truncated / malformed JSON — skip the thread, don't crash.
+                log.warning("LLM patch output unusable for thread %s: %s", thread.id, e)
+                round_result.skipped.append((thread.id, f"llm output unusable: {e}"))
+                continue
+            except Exception as e:  # provider-side errors (rate limits, 5xx, etc.)
+                log.warning("LLM call failed for thread %s: %s", thread.id, e)
+                round_result.skipped.append((thread.id, f"llm error: {e}"))
+                continue
             try:
                 report = patcher.check_safe(patch)
             except UnsafePatchError as e:
@@ -196,12 +237,12 @@ def main(argv: list[str] | None = None) -> int:
                 gh.resolve_thread(thread.id)
             except Exception as e:
                 log.warning("Failed to resolve thread %s: %s", thread.id, e)
-            state.mark_handled(thread.id, thread.body_text)
+            state.mark_processed(thread.root_comment)
 
         state.record_round(round_result)
         last_failure = None
     else:
-        unresolved = [t.id for t in gh.list_unresolved_bugbot_threads(inputs.pr_number)]
+        unresolved = [t.id for t in gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)]
         _escalate(gh, inputs, state, EscalationReason.MAX_ROUNDS, unresolved)
 
     gh.close()
@@ -259,8 +300,8 @@ def _escalate(
 ) -> None:
     state.escalate(reason, unresolved)
     try:
-        gh.add_label(inputs.pr_number, inputs.needs_human_label)
-        gh.post_pr_comment(
+        gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
+        gh.create_pr_comment(
             inputs.pr_number,
             f"🤖 **pr-autofix-agent** is escalating to a human reviewer.\n\n"
             f"Reason: `{reason.value}`\n"
