@@ -369,11 +369,21 @@ def main(argv: list[str] | None = None) -> int:
             "GIT_AUTHOR_EMAIL", "pr-autofix-agent[bot]@users.noreply.github.com"
         )
         # Aggregate one summary line per thread across the entire round so
-        # the commit body covers every fix, not just patches[0].
-        summary_lines = [
-            f"- thread {thread.id}: {patch.summary}"
-            for thread, patch in patches
-        ]
+        # the commit body covers every fix, not just patches[0]. The batched
+        # path pairs the same synthetic Patch with every thread; collapse
+        # into one line per unique patch (keyed by thread_id) so the commit
+        # body doesn't repeat "batched fix for N thread(s)" N times.
+        seen_patch_ids: set[str] = set()
+        summary_lines: list[str] = []
+        for thread, patch in patches:
+            if patch.thread_id in seen_patch_ids:
+                continue
+            seen_patch_ids.add(patch.thread_id)
+            if batch_used:
+                ids = ", ".join(t.id for t, _ in patches)
+                summary_lines.append(f"- threads {ids}: {patch.summary}")
+            else:
+                summary_lines.append(f"- thread {thread.id}: {patch.summary}")
         sha = patcher.stage_and_commit(summary_lines, applied_paths, author_email)
         if sha is None:
             log.info(

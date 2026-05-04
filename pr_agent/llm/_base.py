@@ -221,9 +221,16 @@ def format_generate_patch_user(
 
 
 def _format_thread_for_batch(idx: int, thread: ReviewThread) -> str:
+    if thread.path:
+        location = (
+            f"{thread.path}:{thread.line}"
+            if thread.line is not None
+            else thread.path
+        )
+    else:
+        location = "(no path)"
     parts = [
-        f"[{idx}] thread {thread.id} @ {thread.path or '(none)'}:"
-        f"{thread.line if thread.line is not None else '?'}",
+        f"[{idx}] thread {thread.id} @ {location}",
         thread.body_text,
     ]
     hunk = thread.comments[0].diff_hunk if thread.comments else None
