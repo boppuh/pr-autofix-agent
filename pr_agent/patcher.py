@@ -20,6 +20,7 @@ nothing about.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import logging
 import re
@@ -288,6 +289,12 @@ def _run_git_apply_pipeline(
             _run_git(["apply", tmp_path], cwd=repo_root)
         except RuntimeError as e:
             log.info("apply pipeline: git apply failed: %s", e)
+            # git apply is documented as atomic but defensive: if anything
+            # did mutate before the failure, reverse-apply so the per-thread
+            # fallback starts from a clean tree. Best-effort — a failed
+            # revert doesn't change the return.
+            with contextlib.suppress(RuntimeError):
+                _run_git(["apply", "--reverse", tmp_path], cwd=repo_root)
             return False
 
         # Post-apply: git diff --check catches whitespace errors and merge-

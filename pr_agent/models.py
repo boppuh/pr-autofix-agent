@@ -48,6 +48,18 @@ class ReviewThread:
         """Convenience: the line of the root comment."""
         return self.comments[0].line if self.comments else None
 
+    @property
+    def location(self) -> str:
+        """Render the thread's location as ``path:line`` / ``path`` /
+        ``(no path)``. Used by run-summary reporting, batched-prompt
+        rendering, and human-escalation listings — keep in one place
+        so the three contexts stay consistent."""
+        if not self.path:
+            return "(no path)"
+        if self.line is not None:
+            return f"{self.path}:{self.line}"
+        return self.path
+
 
 # --- Classification --------------------------------------------------------
 

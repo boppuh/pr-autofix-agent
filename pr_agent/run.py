@@ -220,13 +220,14 @@ def main(argv: list[str] | None = None) -> int:
             diff = None
 
         if diff and diff.startswith("ESCALATE:"):
+            # The batch model may decline for whole-batch reasons ("too many
+            # comments", "needs cross-file refactor") that don't apply to
+            # individual threads. Fall through to the per-thread path so
+            # each thread gets its own chance — don't burn attempts and
+            # skip the round.
             reason = diff.removeprefix("ESCALATE:").strip() or "model returned ESCALATE"
-            log.info("Model escalated batch: %s", reason)
-            for t in live_fixable:
-                round_result.skipped.append((t.id, f"escalated by model: {reason}"))
-                state.increment_attempt(t.id)
-            state.record_round(round_result)
-            continue
+            log.info("Model escalated batch (%s); falling through to per-thread.", reason)
+            diff = None
 
         if diff is not None:
             # Dry-run check BEFORE we mutate anything via git apply.
@@ -575,12 +576,8 @@ def _format_reply(patch: Patch, sha: str) -> str:
 
 
 def _loc(thread: ReviewThread) -> str:
-    """Render a thread's location as `path:line` / `path` / `(no path)`."""
-    if not thread.path:
-        return "(no path)"
-    if thread.line is not None:
-        return f"{thread.path}:{thread.line}"
-    return thread.path
+    """Thin alias retained for call-site readability."""
+    return thread.location
 
 
 def _format_run_summary(report: AgentRunReport) -> str:
@@ -694,11 +691,9 @@ def _summarize_human_threads(skipped: list[tuple[ReviewThread, str]]) -> str:
     ]
     cap = 20
     for thread, reason in skipped[:cap]:
-        if thread.path:
-            line_part = f":{thread.line}" if thread.line is not None else ""
-            location = f"`{thread.path}{line_part}`"
-        else:
-            location = "(no path)"
+        # Wrap path-bearing locations in backticks; keep the bare "(no path)"
+        # marker readable.
+        location = f"`{thread.location}`" if thread.path else thread.location
         lines.append(f"- {location} — {reason}")
     if len(skipped) > cap:
         lines.append(f"... and {len(skipped) - cap} more.")
