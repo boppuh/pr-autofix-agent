@@ -13,8 +13,11 @@ from .github_client import GitHubClient
 from .llm import LLMResponseError, make_provider
 from .llm._factory import default_model_for, env_var_for
 from .models import (
+    AgentRunReport,
     CommandResult,
+    EscalatedThread,
     EscalationReason,
+    HandledThread,
     Patch,
     PatchFile,
     ReviewThread,
@@ -79,8 +82,7 @@ def main(argv: list[str] | None = None) -> int:
             log.info(
                 "%s is not set, but no Bugbot threads to triage. Done.", provider_env
             )
-        gh.close()
-        return 0
+        return _finish(gh, inputs.pr_number, state)
 
     log.info("Using LLM provider=%s model=%s", inputs.provider, model)
     llm = make_provider(inputs.provider, model=model, api_key=llm_key)
@@ -107,16 +109,14 @@ def main(argv: list[str] | None = None) -> int:
             log.warning("Runtime budget (%dm) exhausted.", safety.max_runtime_minutes)
             unresolved = [t.id for t in gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)]
             _escalate(gh, inputs, state, EscalationReason.RUNTIME_BUDGET_EXHAUSTED, unresolved)
-            gh.close()
-            return 0
+            return _finish(gh, inputs.pr_number, state)
 
         log.info("=== round %d/%d ===", round_no, max_rounds)
         threads = gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)
         if not threads:
             log.info("No unresolved Bugbot threads. Done.")
             _post_clean(gh, inputs.pr_number)
-            gh.close()
-            return 0
+            return _finish(gh, inputs.pr_number, state)
 
         # Stop-on-no-progress guard: from round 2 onward, escalate if the
         # unresolved count didn't decrease since the previous round.
@@ -128,8 +128,7 @@ def main(argv: list[str] | None = None) -> int:
                 EscalationReason.NO_PROGRESS,
                 [t.id for t in threads],
             )
-            gh.close()
-            return 0
+            return _finish(gh, inputs.pr_number, state)
 
         if len(threads) > safety.max_comments_per_round:
             log.info(
@@ -146,6 +145,12 @@ def main(argv: list[str] | None = None) -> int:
         # for review). IGNORE threads are recorded but won't drive escalation.
         round_result.skipped.extend((t.id, r) for t, r in triage.skipped)
         round_result.skipped.extend((t.id, r) for t, r in triage.ignored)
+        # Surface NEEDS_HUMAN routes for the end-of-run summary's
+        # 'Escalated:' section. IGNORE entries are silent (non-actionable).
+        round_result.escalated_to_human.extend(
+            EscalatedThread(thread_id=t.id, location=_loc(t), reason=r)
+            for t, r in triage.skipped
+        )
 
         if not triage.fixable:
             # Phase 11 spec: if every thread routed to NEEDS_HUMAN, escalate
@@ -171,8 +176,7 @@ def main(argv: list[str] | None = None) -> int:
                     EscalationReason.NO_FIXABLE_THREADS,
                     [t.id for t in threads],
                 )
-                gh.close()
-                return 0
+                return _finish(gh, inputs.pr_number, state)
             log.info("No auto-fixable threads remaining.")
             state.record_round(round_result)
             break
@@ -230,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 for t in live_fixable:
                     state.increment_attempt(t.id)
                 state.record_round(round_result)
-                return 0
+                return _finish(gh, inputs.pr_number, state)
             try:
                 applied_paths = patcher.apply_diff(diff, [t.id for t in live_fixable])
             except UnsafePatchError as e:
@@ -301,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
                         patch.summary,
                     )
                 state.record_round(round_result)
-                return 0
+                return _finish(gh, inputs.pr_number, state)
 
             for _, patch in patches:
                 applied_paths.extend(patcher.apply(patch))
@@ -333,8 +337,7 @@ def main(argv: list[str] | None = None) -> int:
                     EscalationReason.VALIDATION_FAILED,
                     unresolved_ids,
                 )
-                gh.close()
-                return 0
+                return _finish(gh, inputs.pr_number, state)
 
             # Retry path: feed the failure into the next LLM round; escalate
             # only if we see the same failure signature twice in a row.
@@ -350,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
                     EscalationReason.REPEATED_VALIDATION_FAILURE,
                     unresolved_ids,
                 )
-                return 0
+                return _finish(gh, inputs.pr_number, state)
             continue
 
         author_email = os.environ.get(
@@ -377,13 +380,24 @@ def main(argv: list[str] | None = None) -> int:
         round_result.fixed_thread_ids = [t.id for t, _ in patches]
 
         for thread, patch in patches:
-            body = _format_reply(patch, sha)
+            if safety.post_per_thread_replies:
+                body = _format_reply(patch, sha)
+                try:
+                    gh.reply_to_thread(inputs.pr_number, thread.root_comment.id, body)
+                except Exception as e:
+                    log.warning("Failed to reply to thread %s: %s", thread.id, e)
             try:
-                gh.reply_to_thread(inputs.pr_number, thread.root_comment.id, body)
                 gh.resolve_thread(thread.id)
             except Exception as e:
                 log.warning("Failed to resolve thread %s: %s", thread.id, e)
             state.mark_processed(thread.root_comment)
+            round_result.handled.append(
+                HandledThread(
+                    thread_id=thread.id,
+                    location=_loc(thread),
+                    summary=patch.summary,
+                )
+            )
 
         state.record_round(round_result)
         last_failure = None
@@ -391,8 +405,7 @@ def main(argv: list[str] | None = None) -> int:
         unresolved = [t.id for t in gh.get_unresolved_bugbot_threads(inputs.pr_number, repo_cfg.bugbot_logins)]
         _escalate(gh, inputs, state, EscalationReason.MAX_ROUNDS, unresolved)
 
-    gh.close()
-    return 0
+    return _finish(gh, inputs.pr_number, state)
 
 
 def _gather_excerpts(
@@ -539,6 +552,85 @@ def _format_reply(patch: Patch, sha: str) -> str:
         f"{patch.summary}\n\n"
         f"Files changed:\n{files}\n"
     )
+
+
+def _loc(thread: ReviewThread) -> str:
+    """Render a thread's location as `path:line` / `path` / `(no path)`."""
+    if not thread.path:
+        return "(no path)"
+    if thread.line is not None:
+        return f"{thread.path}:{thread.line}"
+    return thread.path
+
+
+def _format_run_summary(report: AgentRunReport) -> str:
+    """Render the end-of-run PR-level summary comment.
+
+    Returns the empty string when there are no rounds to summarise so
+    callers can short-circuit.
+    """
+    if not report.rounds:
+        return ""
+    lines: list[str] = ["## PR Autofix Agent — Run Summary"]
+    for r in report.rounds:
+        lines.append("")
+        lines.append(f"### Round {r.round_no}")
+        had_section = False
+        if r.handled:
+            lines.append("")
+            lines.append("Handled:")
+            for h in r.handled:
+                lines.append(f"- `{h.location}` — {h.summary}")
+            had_section = True
+        if r.validation.command_results:
+            lines.append("")
+            lines.append("Validation:")
+            for c in r.validation.command_results:
+                status = "passed" if c.ok else f"failed (exit {c.exit_code})"
+                lines.append(f"- {c.name}: {status}")
+            had_section = True
+        if r.escalated_to_human:
+            lines.append("")
+            lines.append("Escalated:")
+            for e in r.escalated_to_human:
+                lines.append(f"- `{e.location}` — {e.reason}")
+            had_section = True
+        if r.error:
+            lines.append("")
+            lines.append(f"Error: {r.error}")
+            had_section = True
+        if not had_section:
+            lines.append("")
+            lines.append("(no actions taken this round)")
+    if report.escalated:
+        reason = report.escalation_reason.value if report.escalation_reason else "unknown"
+        n = len(report.final_unresolved_thread_ids)
+        lines.append("")
+        lines.append("---")
+        lines.append(f"Final status: escalated (`{reason}`) — {n} unresolved thread(s).")
+    return "\n".join(lines)
+
+
+def _post_run_summary(gh: GitHubClient, pr_number: int, report: AgentRunReport) -> None:
+    """Post the end-of-run summary comment. Best-effort + no-op on empty."""
+    body = _format_run_summary(report)
+    if not body:
+        return
+    try:
+        gh.create_pr_comment(pr_number, body)
+    except Exception as e:
+        log.warning("Could not post run-summary comment: %s", e)
+
+
+def _finish(gh: GitHubClient, pr_number: int, state: AgentState) -> int:
+    """Post the run summary, close the GitHub client, and return exit code 0.
+
+    Single funnel for every clean exit path in :func:`main` so we can't
+    accidentally drop the summary on one branch.
+    """
+    _post_run_summary(gh, pr_number, state.report)
+    gh.close()
+    return 0
 
 
 def _post_clean(gh: GitHubClient, pr_number: int) -> None:
