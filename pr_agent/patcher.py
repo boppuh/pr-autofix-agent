@@ -179,6 +179,9 @@ class Patcher:
 
 _DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
 _PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(\S+)$", re.MULTILINE)
+# Matches the +++ and --- file header lines in unified diff format.
+# These are exactly three characters followed by a space and a path.
+_HEADER_LINE_RE = re.compile(r"^(?:\+\+\+|---) ")
 
 
 def _paths_from_diff(diff_text: str) -> list[str]:
@@ -202,10 +205,16 @@ def _paths_from_diff(diff_text: str) -> list[str]:
 
 
 def _count_changed_lines(diff_text: str) -> int:
-    """Count payload +/- lines, excluding the +++ / --- header rows."""
+    """Count payload +/- lines, excluding the +++ / --- header rows.
+
+    Header rows are exactly ``+++ <path>`` or ``--- <path>`` (three marker
+    characters followed by a space).  Payload lines that happen to start with
+    ``--`` or ``++`` (e.g. a removed/added line whose content begins with
+    dashes) are still counted.
+    """
     count = 0
     for line in diff_text.splitlines():
-        if line.startswith(("+++", "---")):
+        if _HEADER_LINE_RE.match(line):
             continue
         if line.startswith(("+", "-")):
             count += 1
