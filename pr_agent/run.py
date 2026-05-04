@@ -155,11 +155,17 @@ def main(argv: list[str] | None = None) -> int:
             if triage.skipped:
                 log.info("All threads routed to NEEDS_HUMAN; escalating.")
                 body = _summarize_human_threads(triage.skipped)
+                # Each call gets its own try/except so a comment-API hiccup
+                # doesn't drop the label (and vice versa) — humans need at
+                # least one of the two signals to discover the PR.
                 try:
                     gh.create_pr_comment(inputs.pr_number, body)
+                except Exception as e:
+                    log.warning("Could not post all-needs-human comment: %s", e)
+                try:
                     gh.add_labels(inputs.pr_number, [inputs.needs_human_label])
                 except Exception as e:
-                    log.warning("Could not post all-needs-human escalation: %s", e)
+                    log.warning("Could not apply all-needs-human label: %s", e)
                 state.record_round(round_result)
                 state.escalate(
                     EscalationReason.NO_FIXABLE_THREADS,
