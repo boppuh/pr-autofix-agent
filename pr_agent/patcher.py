@@ -56,9 +56,6 @@ class UnsafePatchError(Exception):
 
 _DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
 _PLUS_FILE_RE = re.compile(r"^\+\+\+ b/(\S+)$", re.MULTILINE)
-# Matches the +++ and --- file-header lines in unified diff format.
-# These are exactly three characters followed by a space and a path.
-_HEADER_LINE_RE = re.compile(r"^(?:\+\+\+|---) ")
 
 
 def extract_touched_files(diff_text: str) -> list[str]:
@@ -88,14 +85,21 @@ def extract_touched_files(diff_text: str) -> list[str]:
 def count_patch_lines(diff_text: str) -> int:
     """Count payload +/- lines, excluding the ``+++`` / ``---`` header rows.
 
-    Header rows are exactly ``+++ <path>`` or ``--- <path>`` (three marker
-    characters followed by a space). Payload lines that happen to start with
-    ``--`` or ``++`` (e.g. a removed/added line whose content begins with
-    dashes) are still counted.
+    Uses a small state machine: the file-header rows ``--- <path>`` and
+    ``+++ <path>`` only ever appear *before* the first ``@@`` hunk marker
+    of a file. Once we've entered a hunk, every line beginning with ``+``
+    or ``-`` is payload — including a removed line whose content happens
+    to start with ``-- `` (which appears in the diff as ``--- <content>``,
+    indistinguishable from a header by regex alone).
     """
     count = 0
+    in_hunk = False
     for line in diff_text.splitlines():
-        if _HEADER_LINE_RE.match(line):
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            # File-header territory (diff --git, index, ---/+++ paths, etc.)
             continue
         if line.startswith(("+", "-")):
             count += 1
@@ -154,7 +158,20 @@ def apply_unified_diff(
         )
         return False
 
-    # Stage diff to a temp file; check + apply + post-apply check.
+    return _run_git_apply_pipeline(diff_text, repo_root=repo_root, files=files)
+
+
+def _run_git_apply_pipeline(
+    diff_text: str, *, repo_root: Path, files: list[str]
+) -> bool:
+    """Run ``git apply --check``, ``git apply``, and post-apply ``git diff
+    --check`` (with revert-on-failure) against ``repo_root``.
+
+    Callers MUST run their own safety guards (file count, protected paths,
+    line limits, etc.) before invoking this — the pipeline does only the
+    git-level work. Returns ``True`` on a clean apply, ``False`` on any
+    git-level rejection (logs the reason at INFO).
+    """
     with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as tmp:
         tmp.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
         tmp_path = tmp.name
@@ -162,12 +179,12 @@ def apply_unified_diff(
         try:
             _run_git(["apply", "--check", tmp_path], cwd=repo_root)
         except RuntimeError as e:
-            log.info("apply_unified_diff: git apply --check failed: %s", e)
+            log.info("apply pipeline: git apply --check failed: %s", e)
             return False
         try:
             _run_git(["apply", tmp_path], cwd=repo_root)
         except RuntimeError as e:
-            log.info("apply_unified_diff: git apply failed: %s", e)
+            log.info("apply pipeline: git apply failed: %s", e)
             return False
 
         # Post-apply: git diff --check catches whitespace errors and merge-
@@ -178,19 +195,19 @@ def apply_unified_diff(
         try:
             _run_git(["diff", "--check", "--"] + files, cwd=repo_root)
         except RuntimeError as e:
-            log.info("apply_unified_diff: git diff --check failed; reverting: %s", e)
+            log.info("apply pipeline: git diff --check failed; reverting: %s", e)
             try:
                 _run_git(["apply", "--reverse", tmp_path], cwd=repo_root)
             except RuntimeError as revert_err:  # working tree now in unknown state
                 log.warning(
-                    "apply_unified_diff: revert via git apply --reverse FAILED (%s); "
+                    "apply pipeline: revert via git apply --reverse FAILED (%s); "
                     "working tree may be inconsistent",
                     revert_err,
                 )
             return False
     finally:
         Path(tmp_path).unlink(missing_ok=True)
-    log.info("apply_unified_diff: applied %d file(s)", len(files))
+    log.info("apply pipeline: applied %d file(s)", len(files))
     return True
 
 
@@ -288,16 +305,13 @@ class Patcher:
                 f"patch too large ({n_lines} > {self._max_patch_lines} lines)"
             )
 
-        # All guards passed at the class level. Delegate the actual apply
-        # (including the post-apply git diff --check step) to the free
-        # function. Translate False into a generic UnsafePatchError; the
-        # specific reason is in the logs from apply_unified_diff itself.
-        ok = apply_unified_diff(
-            diff_text,
-            repo_root=self._root,
-            protected_paths=self._protected,
-            max_files=self._max_files,
-            max_patch_lines=self._max_patch_lines,
+        # All guards passed at the class level. Delegate the actual git
+        # work (apply --check / apply / post-apply diff --check / revert)
+        # to the shared pipeline. We bypass apply_unified_diff to avoid
+        # re-running the safety guards we just performed (file count,
+        # protected paths, line limits) — the pipeline only touches git.
+        ok = _run_git_apply_pipeline(
+            diff_text, repo_root=self._root, files=files
         )
         if not ok:
             raise UnsafePatchError(
