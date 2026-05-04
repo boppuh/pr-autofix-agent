@@ -116,7 +116,10 @@ class Patcher:
                 self._git("apply", "--check", tmp_path)
             except RuntimeError as e:
                 raise UnsafePatchError(f"git apply --check failed: {e}") from e
-            self._git("apply", tmp_path)
+            try:
+                self._git("apply", tmp_path)
+            except RuntimeError as e:
+                raise UnsafePatchError(f"git apply failed: {e}") from e
         finally:
             Path(tmp_path).unlink(missing_ok=True)
         log.info(
