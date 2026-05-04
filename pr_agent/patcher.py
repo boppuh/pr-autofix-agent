@@ -65,6 +65,7 @@ _DIFF_GIT_RE = re.compile(
     r' (?:b/(\S+)|"b/((?:[^"\\]|\\.)*)")$'
 )
 _PLUS_HEADER_RE = re.compile(r'^\+\+\+ (?:b/(\S+)|"b/((?:[^"\\]|\\.)*)")$')
+_MINUS_HEADER_RE = re.compile(r'^--- (?:a/(\S+)|"a/((?:[^"\\]|\\.)*)")$')
 
 # Standard C-style single-char escapes git emits in quoted paths.
 _QUOTED_SHORT_ESCAPES = {
@@ -133,13 +134,17 @@ def _path_from_match(plain: str, quoted: str) -> str:
 def extract_touched_files(diff_text: str) -> list[str]:
     """Every repo-relative path the diff names.
 
-    Returns the union of paths from ``diff --git a/X b/Y`` headers and
-    ``+++ b/Y`` lines. ``git apply`` decides target files from the
-    ``---``/``+++`` headers, not from ``diff --git`` — so a malicious /
-    confused diff with mismatched headers (e.g. ``diff --git a/safe.py
-    b/safe.py`` but ``+++ b/.github/workflows/ci.yml``) would otherwise
-    pass safety checks against ``safe.py`` while ``git apply`` mutates
-    the workflow file. Validating the union closes that gap.
+    Returns the union of paths from ``diff --git a/X b/Y`` headers
+    (both sides), ``+++ b/Y`` lines, and ``--- a/X`` lines. ``git apply``
+    decides target files from the ``---``/``+++`` headers, not from
+    ``diff --git`` — so a malicious / confused diff with mismatched
+    headers would otherwise pass safety checks against the wrong path.
+    Validating the union closes that gap.
+
+    Both *source* and *destination* sides are extracted so a rename or
+    copy diff (``diff --git a/secrets/key.py b/src/utils.py``) can't
+    move a protected file out of a protected directory without
+    triggering ``violates_protected_paths``.
 
     Handles git's quoted-path form (``"b/path with spaces.py"``) so a
     diff targeting a protected path that git happens to quote can't slip
@@ -148,9 +153,9 @@ def extract_touched_files(diff_text: str) -> list[str]:
     Uses a small state machine instead of a global multiline regex: a
     payload addition line whose content begins with ``++ b/...`` would
     render in the diff as ``+++ b/...``, indistinguishable from a real
-    file header without context. Only the ``+++`` line that appears in
-    file-header position (between ``diff --git`` and the first ``@@``
-    of that file) is treated as a header.
+    file header without context. Only the ``+++`` / ``---`` lines that
+    appear in file-header position (between ``diff --git`` and the
+    first ``@@`` of that file) are treated as headers.
     """
     paths: list[str] = []
     seen: set[str] = set()
@@ -169,15 +174,23 @@ def extract_touched_files(diff_text: str) -> list[str]:
             in_header = True
             m = _DIFF_GIT_RE.match(line)
             if m:
+                # Both a-side (source) and b-side (destination): a rename
+                # diff lists distinct paths and a protected source must
+                # still trigger the guard.
+                _add(_path_from_match(m.group(1), m.group(2)))
                 _add(_path_from_match(m.group(3), m.group(4)))
             continue
         if line.startswith("@@"):
             in_header = False
             continue
         if in_header and line.startswith("+++ "):
-            m2 = _PLUS_HEADER_RE.match(line)
-            if m2:
-                _add(_path_from_match(m2.group(1), m2.group(2)))
+            mp = _PLUS_HEADER_RE.match(line)
+            if mp:
+                _add(_path_from_match(mp.group(1), mp.group(2)))
+        elif in_header and line.startswith("--- "):
+            mm = _MINUS_HEADER_RE.match(line)
+            if mm:
+                _add(_path_from_match(mm.group(1), mm.group(2)))
     return paths
 
 

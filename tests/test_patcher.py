@@ -331,6 +331,23 @@ def test_count_patch_lines_counts_payload_starting_with_double_dash():
     assert count_patch_lines(diff) == 2
 
 
+def test_extract_touched_files_includes_rename_source():
+    """Regression: a rename diff names distinct a-side and b-side paths.
+    Without extracting the a-side, a protected source file could be
+    renamed OUT of a protected directory without tripping the guard."""
+    diff = (
+        "diff --git a/secrets/key.py b/src/utils.py\n"
+        "similarity index 100%\n"
+        "rename from secrets/key.py\n"
+        "rename to src/utils.py\n"
+    )
+    paths = extract_touched_files(diff)
+    assert "secrets/key.py" in paths
+    assert "src/utils.py" in paths
+    # And violates_protected_paths sees the source.
+    assert violates_protected_paths(paths, ["secrets/"]) is True
+
+
 def test_extract_touched_files_decodes_octal_non_ascii_paths():
     """Regression: git emits C-style octal escapes for non-ASCII bytes
     (\\303\\251 = UTF-8 'é'). unicode_escape interprets \\303 as U+00C3
