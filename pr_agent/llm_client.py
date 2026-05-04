@@ -12,6 +12,10 @@ from .models import Classification, ClassificationLabel, Patch, PatchFile, Revie
 
 log = logging.getLogger(__name__)
 
+
+class LLMResponseError(Exception):
+    """LLM returned text that did not decode to a JSON object."""
+
 _CLASSIFY_SYSTEM = """You triage Cursor Bugbot PR review comments.
 
 Decide whether a comment is AUTO-FIXABLE (small, mechanical, scoped) or HUMAN-REQUIRED
@@ -86,7 +90,9 @@ class LLMClient:
             pr_body_excerpt=pr_body_excerpt,
             pr_diff_excerpt=pr_diff_excerpt,
         )
-        text = self._call(system=_PATCH_SYSTEM, user=user, max_tokens=4000)
+        # Patches must include full file contents, so give the model headroom.
+        # 4000 was hitting truncation on real-sized source files.
+        text = self._call(system=_PATCH_SYSTEM, user=user, max_tokens=16000)
         data = _extract_json(text)
         files_raw = data.get("files") or []
         files = [PatchFile.model_validate(f) for f in files_raw]
@@ -190,4 +196,4 @@ def _extract_json(text: str) -> dict[str, Any]:
                 return obj
         except json.JSONDecodeError:
             continue
-    raise ValueError(f"LLM did not return valid JSON object: {text[:200]!r}")
+    raise LLMResponseError(f"LLM did not return valid JSON object: {text[:200]!r}")

@@ -9,7 +9,7 @@ from pathlib import Path
 from .classifier import Classifier
 from .config import ConfigError, load_target_repo_config, load_workflow_inputs, require_env
 from .github_client import GitHubClient
-from .llm_client import LLMClient
+from .llm_client import LLMClient, LLMResponseError
 from .models import (
     EscalationReason,
     Patch,
@@ -128,15 +128,25 @@ def main(argv: list[str] | None = None) -> int:
                 round_result.skipped.append((thread.id, "already handled"))
                 continue
             file_contents = _collect_file_contents(repo_root, thread)
-            patch = llm.propose_patch(
-                thread=thread,
-                file_contents=file_contents,
-                max_files=safety.max_files_touched,
-                prior_failure=last_failure,
-                pr_title=pr.title,
-                pr_body_excerpt=pr.body[:2000] if pr.body else None,
-                pr_diff_excerpt=pr_diff,
-            )
+            try:
+                patch = llm.propose_patch(
+                    thread=thread,
+                    file_contents=file_contents,
+                    max_files=safety.max_files_touched,
+                    prior_failure=last_failure,
+                    pr_title=pr.title,
+                    pr_body_excerpt=pr.body[:2000] if pr.body else None,
+                    pr_diff_excerpt=pr_diff,
+                )
+            except LLMResponseError as e:
+                # Truncated / malformed JSON — skip the thread, don't crash.
+                log.warning("LLM patch output unusable for thread %s: %s", thread.id, e)
+                round_result.skipped.append((thread.id, f"llm output unusable: {e}"))
+                continue
+            except Exception as e:  # provider-side errors (rate limits, 5xx, etc.)
+                log.warning("LLM call failed for thread %s: %s", thread.id, e)
+                round_result.skipped.append((thread.id, f"llm error: {e}"))
+                continue
             try:
                 report = patcher.check_safe(patch)
             except UnsafePatchError as e:

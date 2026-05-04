@@ -323,7 +323,6 @@ class GitHubClient:
     def __init__(self, token: str, owner: str, repo: str):
         self.owner = owner
         self.repo = repo
-        self._token = token
         self._http = _http(token)
 
     @classmethod
