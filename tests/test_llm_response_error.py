@@ -41,24 +41,24 @@ def test_patch_prompt_no_leading_newline_without_pr_context(thread_factory):
     assert out.startswith("Thread path:")
 
 
-def test_classify_returns_human_required_on_truncated_response(monkeypatch, thread_factory):
+def test_classify_returns_needs_human_on_truncated_response(monkeypatch, thread_factory):
     """Regression: when the classifier model returns non-JSON, classify must
-    fall back to HUMAN_REQUIRED instead of letting LLMResponseError escape and
+    fall back to NEEDS_HUMAN instead of letting LLMResponseError escape and
     crash the agent loop."""
     from unittest.mock import MagicMock
 
     from pr_agent.llm import anthropic as a_mod
     from pr_agent.llm._factory import make_provider
-    from pr_agent.models import ClassificationLabel
 
     fake = MagicMock()
     # Truncated/garbage output the classifier might return.
     fake.messages.create.return_value = MagicMock(
-        content=[MagicMock(type="text", text='{"label": "auto_fix')]
+        content=[MagicMock(type="text", text='{"category": "AUTO_FIX')]
     )
     monkeypatch.setattr(a_mod, "Anthropic", lambda **kw: fake)
 
     provider = make_provider("anthropic", model="claude-sonnet-4-6", api_key="k")
     cls = provider.classify(thread_factory(), file_excerpt=None)
-    assert cls.label is ClassificationLabel.HUMAN_REQUIRED
+    assert cls.category == "NEEDS_HUMAN"
     assert "failed validation" in cls.reason
+    assert cls.thread_id == "T_1"

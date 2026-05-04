@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from .models import BugbotComment, CheckRun, PullRequest, ReviewThread
+from .models import CheckRun, PullRequest, ReviewComment, ReviewThread
 
 log = logging.getLogger(__name__)
 
@@ -183,9 +182,9 @@ def get_unresolved_bugbot_threads(
     matches = {login.lower() for login in bugbot_logins}
     out: list[ReviewThread] = []
     for t in get_review_threads(owner, repo, pr_number, token=token, http=http):
-        if t.is_resolved or t.is_outdated:
+        if t.is_resolved:
             continue
-        if not any(c.author_login.lower() in matches for c in t.comments):
+        if not any(c.author.lower() in matches for c in t.comments):
             continue
         out.append(t)
     log.info("Found %d unresolved Bugbot threads on %s/%s#%d", len(out), owner, repo, pr_number)
@@ -409,6 +408,10 @@ def _fetch_pr(
             }
         page = pr["reviewThreads"]
         for node in page["nodes"]:
+            # Filter outdated at fetch time — the model no longer carries an
+            # is_outdated field, but we still want to skip stale threads.
+            if node.get("isOutdated", False):
+                continue
             threads.append(_thread_from_node(node))
         if not page["pageInfo"]["hasNextPage"]:
             break
@@ -441,32 +444,19 @@ def _graphql(
 
 def _thread_from_node(node: dict[str, Any]) -> ReviewThread:
     comments = [
-        BugbotComment(
+        ReviewComment(
             id=str(c.get("databaseId") or c["id"]),
-            author_login=(c.get("author") or {}).get("login", "") or "",
+            author=(c.get("author") or {}).get("login", "") or "",
             body=c["body"],
             path=c.get("path") or node.get("path"),
             line=c.get("line") if c.get("line") is not None else node.get("line"),
-            original_line=c.get("originalLine"),
             diff_hunk=c.get("diffHunk"),
-            created_at=_parse_dt(c["createdAt"]),
+            created_at=str(c["createdAt"]),
         )
         for c in node["comments"]["nodes"]
     ]
     return ReviewThread(
         id=node["id"],
-        path=node.get("path"),
-        line=node.get("line"),
         is_resolved=node["isResolved"],
-        is_outdated=node.get("isOutdated", False),
         comments=comments,
     )
-
-
-def _parse_dt(s: str) -> datetime:
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt

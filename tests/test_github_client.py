@@ -83,8 +83,7 @@ def test_get_pr_parses_metadata_and_threads(token):
         assert pr.base_ref_name == "main"
         assert len(pr.threads) == 1
         c = pr.threads[0].comments[0]
-        assert c.author_login == "cursor"
-        assert c.original_line == 10
+        assert c.author == "cursor"
         assert c.diff_hunk and "+y" in c.diff_hunk
 
 

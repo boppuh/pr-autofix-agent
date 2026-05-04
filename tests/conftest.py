@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import subprocess
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from pr_agent.models import BugbotComment, ReviewThread
+from pr_agent.models import ReviewComment, ReviewThread
 
 
 def make_thread(
@@ -19,18 +18,16 @@ def make_thread(
 ) -> ReviewThread:
     return ReviewThread(
         id=thread_id,
-        path=path,
-        line=line,
         is_resolved=False,
-        is_outdated=False,
         comments=[
-            BugbotComment(
+            ReviewComment(
                 id="1",
-                author_login=author,
+                author=author,
                 body=body,
                 path=path,
                 line=line,
-                created_at=datetime.now(UTC),
+                diff_hunk=None,
+                created_at="2024-01-01T00:00:00Z",
             )
         ],
     )

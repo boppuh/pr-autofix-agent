@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 
 from .models import AgentRunReport, EscalationReason, RoundResult
@@ -61,7 +63,9 @@ class AgentState:
         if not self._persist_path:
             return
         try:
-            self._persist_path.write_text(self._report.model_dump_json(indent=2))
+            self._persist_path.write_text(
+                json.dumps(asdict(self._report), indent=2, default=str)
+            )
         except OSError as e:
             log.warning("Could not persist state: %s", e)
 

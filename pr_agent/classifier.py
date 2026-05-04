@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ._paths import matches_any_protected
 from .llm import LLMProvider
-from .models import Classification, ClassificationLabel, ReviewThread
+from .models import Classification, ReviewThread
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +31,8 @@ _ARCH_RE = re.compile("|".join(ARCHITECTURAL_PATTERNS), re.IGNORECASE)
 @dataclass
 class TriageOutcome:
     fixable: list[ReviewThread]
-    skipped: list[tuple[ReviewThread, str]]
+    skipped: list[tuple[ReviewThread, str]]   # routed to NEEDS_HUMAN bucket
+    ignored: list[tuple[ReviewThread, str]] = field(default_factory=list)
 
 
 class Classifier:
@@ -52,19 +53,29 @@ class Classifier:
     ) -> TriageOutcome:
         fixable: list[ReviewThread] = []
         skipped: list[tuple[ReviewThread, str]] = []
+        ignored: list[tuple[ReviewThread, str]] = []
         for t in threads:
             rule_skip = self._rule_layer(t)
             if rule_skip:
+                # Rule-layer skips are NEEDS_HUMAN, not IGNORE — protected paths
+                # and architectural comments still warrant human attention.
                 skipped.append((t, rule_skip))
                 continue
             cls = self._llm.classify(t, file_excerpts.get(t.id))
             decision = self._apply_threshold(cls)
-            if decision.label is ClassificationLabel.AUTO_FIXABLE:
+            if decision.category == "AUTO_FIX":
                 fixable.append(t)
-            else:
+            elif decision.category == "IGNORE":
+                ignored.append((t, f"ignored: {decision.reason}"))
+            else:  # NEEDS_HUMAN
                 skipped.append((t, f"llm: {decision.reason}"))
-        log.info("Triage: %d fixable, %d skipped", len(fixable), len(skipped))
-        return TriageOutcome(fixable=fixable, skipped=skipped)
+        log.info(
+            "Triage: %d fixable, %d needs-human, %d ignored",
+            len(fixable),
+            len(skipped),
+            len(ignored),
+        )
+        return TriageOutcome(fixable=fixable, skipped=skipped, ignored=ignored)
 
     def _rule_layer(self, thread: ReviewThread) -> str | None:
         if thread.path and self._is_protected(thread.path):
@@ -80,13 +91,14 @@ class Classifier:
         return matches_any_protected(path, self._protected_paths)
 
     def _apply_threshold(self, cls: Classification) -> Classification:
-        if (
-            cls.label is ClassificationLabel.AUTO_FIXABLE
-            and cls.confidence < self._confidence_threshold
-        ):
+        # Only AUTO_FIX is gated by confidence; IGNORE / NEEDS_HUMAN pass through
+        # unchanged (the harm of low-confidence IGNORE is just a missed silent-skip,
+        # whereas low-confidence AUTO_FIX risks a bad code change).
+        if cls.category == "AUTO_FIX" and cls.confidence < self._confidence_threshold:
             return Classification(
-                label=ClassificationLabel.HUMAN_REQUIRED,
-                confidence=cls.confidence,
+                thread_id=cls.thread_id,
+                category="NEEDS_HUMAN",
                 reason=f"low confidence ({cls.confidence:.2f}): {cls.reason}",
+                confidence=cls.confidence,
             )
         return cls

@@ -7,32 +7,30 @@ import logging
 import re
 from typing import Any, Protocol, runtime_checkable
 
-from pydantic import ValidationError
-
-from ..models import (
-    Classification,
-    ClassificationLabel,
-    Patch,
-    PatchFile,
-    ReviewThread,
-)
+from ..models import Classification, Patch, ReviewThread
 
 log = logging.getLogger(__name__)
 
 
-CLASSIFY_SYSTEM = """You triage Cursor Bugbot PR review comments.
+CLASSIFY_SYSTEM = """You triage Cursor Bugbot PR review comments into one of three buckets.
 
-Decide whether a comment is AUTO-FIXABLE (small, mechanical, scoped) or HUMAN-REQUIRED
-(architectural, ambiguous, multi-file design discussion, contract change, security policy).
+AUTO_FIX — small, mechanical, scoped change that an LLM can produce safely.
+  Examples: missing null check, unused import, off-by-one, wrong type, typo
+  in identifier, missing await, dead code removal, fixing a regex, adding
+  a guard.
 
-Auto-fixable examples: missing null check, unused import, off-by-one, wrong type, typo
-in identifier, missing await, dead code removal, fixing a regex, adding a guard.
+NEEDS_HUMAN — the comment requires product/architectural judgement, multi-file
+  design, contract changes, schema migrations, security model changes, or
+  anything ambiguous.
+  Examples: "consider refactoring this module", "the abstraction here is leaky",
+  "this should be split", "API contract change".
 
-Human-required examples: "consider refactoring this module", "the abstraction here is
-leaky", API contract changes, schema migrations, security model changes, anything that
-requires product judgement or touches >2 files conceptually.
+IGNORE — the comment is not actionable as a code change.
+  Examples: "LGTM", "thanks for the fix", praise, status updates, questions
+  the author can answer in chat, `nit:` items the author has already
+  addressed, conversation about non-code topics.
 
-Output strictly valid JSON: {"label": "auto_fixable"|"human_required",
+Output strictly valid JSON: {"category": "AUTO_FIX"|"NEEDS_HUMAN"|"IGNORE",
 "confidence": 0.0-1.0, "reason": "<one sentence>"}.
 """
 
@@ -55,6 +53,7 @@ Output strictly valid JSON:
 class LLMResponseError(Exception):
     """Raised when the provider returns text that doesn't decode to JSON."""
 
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """Every concrete provider exposes the same triage/patch surface."""
@@ -76,28 +75,25 @@ class LLMProvider(Protocol):
 # --- Shared helpers reused by every concrete provider ---------------------
 
 
-def parse_classification(raw_text: str) -> Classification:
+def parse_classification(raw_text: str, thread_id: str) -> Classification:
+    """Decode the classifier's JSON output, falling back to NEEDS_HUMAN on
+    any parse / validation failure (truncated output, schema drift, etc.)."""
     try:
         data = extract_json(raw_text)
-        return Classification.model_validate(data)
-    except (LLMResponseError, ValidationError) as e:
+        return Classification.from_json(data, thread_id=thread_id)
+    except (LLMResponseError, ValueError) as e:
         log.warning("Classifier returned invalid JSON: %s; raw=%r", e, raw_text[:300])
         return Classification(
-            label=ClassificationLabel.HUMAN_REQUIRED,
-            confidence=0.0,
+            thread_id=thread_id,
+            category="NEEDS_HUMAN",
             reason="classifier output failed validation",
+            confidence=0.0,
         )
 
 
 def parse_patch(raw_text: str, thread_id: str) -> Patch:
     data = extract_json(raw_text)
-    files_raw = data.get("files") or []
-    files = [PatchFile.model_validate(f) for f in files_raw]
-    return Patch(
-        thread_id=thread_id,
-        files=files,
-        summary=data.get("summary", "autofix"),
-    )
+    return Patch.from_json(data, thread_id=thread_id)
 
 
 def format_classify_user(thread: ReviewThread, file_excerpt: str | None) -> str:
