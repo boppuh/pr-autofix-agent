@@ -74,6 +74,12 @@ def load_target_repo_config(repo_root: Path) -> TargetRepoConfig:
         max_patch_lines=safety_raw.get("max_patch_lines", MAX_PATCH_LINES),
         max_files_touched=safety_raw.get("max_files_touched", MAX_FILES_TOUCHED),
         max_runtime_minutes=safety_raw.get("max_runtime_minutes", MAX_RUNTIME_MINUTES),
+        exit_on_validation_failure=bool(
+            safety_raw.get("exit_on_validation_failure", True)
+        ),
+        post_per_thread_replies=bool(
+            safety_raw.get("post_per_thread_replies", True)
+        ),
     )
 
     protected_raw = raw.get("protected_paths")

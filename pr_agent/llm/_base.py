@@ -50,8 +50,24 @@ Output strictly valid JSON:
 """
 
 
+GENERATE_PATCH_SYSTEM = """You are an autonomous PR repair agent.
+
+Fix only the Cursor Bugbot comments listed below.
+
+Rules:
+- Return only a unified git diff.
+- Do not include prose.
+- Do not modify unrelated files.
+- Do not exceed the requested scope.
+- Preserve existing behavior unless the comment explicitly identifies a bug.
+- Add or update tests when needed.
+- If the fix is unsafe, ambiguous, or too large, return exactly:
+  ESCALATE: <reason>
+"""
+
+
 class LLMResponseError(Exception):
-    """Raised when the provider returns text that doesn't decode to JSON."""
+    """Raised when the provider returns text that doesn't decode as expected."""
 
 
 @runtime_checkable
@@ -70,6 +86,24 @@ class LLMProvider(Protocol):
         pr_body_excerpt: str | None = None,
         pr_diff_excerpt: str | None = None,
     ) -> Patch: ...
+
+    def generate_patch(
+        self,
+        *,
+        pr_title: str,
+        pr_body: str,
+        pr_diff: str,
+        comments: list[ReviewThread],
+        repo_context: str,
+        validation_commands: list[str],
+        prior_failure: str | None = None,
+    ) -> str:
+        """Phase 8 batched entry point.
+
+        Returns either a unified git diff (no markdown fences, no prose) or
+        the literal string ``"ESCALATE: <reason>"``.
+        """
+        ...
 
 
 # --- Shared helpers reused by every concrete provider ---------------------
@@ -156,6 +190,81 @@ def format_patch_user(
     for path, content in file_contents.items():
         parts += [f"--- {path} ---", "```", content, "```"]
     return "\n".join(parts)
+
+
+def format_generate_patch_user(
+    *,
+    pr_title: str,
+    pr_body: str,
+    pr_diff: str,
+    comments: list[ReviewThread],
+    repo_context: str,
+    validation_commands: list[str],
+    prior_failure: str | None = None,
+) -> str:
+    """Render the Phase 8 batched user message.
+
+    Field names mirror the spec template (`{{pr_title}}`, etc.).
+    """
+    rendered_comments = "\n".join(
+        _format_thread_for_batch(i, t) for i, t in enumerate(comments, start=1)
+    )
+    rendered_validators = (
+        "\n".join(f"  - {cmd}" for cmd in validation_commands) if validation_commands else "  (none)"
+    )
+    prior_failure_block = (
+        f"Validation failure from a previous attempt (do not repeat it):\n"
+        f"```\n{prior_failure[-2000:]}\n```\n\n"
+        if prior_failure
+        else ""
+    )
+    return (
+        f"PR title:\n{pr_title}\n\n"
+        f"PR body:\n{pr_body or '(none)'}\n\n"
+        f"Current PR diff:\n```diff\n{pr_diff}\n```\n\n"
+        f"Repo context:\n{repo_context}\n\n"
+        f"{prior_failure_block}"
+        f"Unresolved Bugbot comments:\n{rendered_comments}\n\n"
+        f"Validation commands:\n{rendered_validators}\n"
+    )
+
+
+def _format_thread_for_batch(idx: int, thread: ReviewThread) -> str:
+    parts = [
+        f"[{idx}] thread {thread.id} @ {thread.location}",
+        thread.body_text,
+    ]
+    hunk = thread.comments[0].diff_hunk if thread.comments else None
+    if hunk:
+        parts += ["Diff hunk:", hunk]
+    return "\n".join(parts)
+
+
+_DIFF_HEADER_RE = re.compile(r"^(diff --git |--- |\+\+\+ |@@ )", re.MULTILINE)
+_FENCE_TOKEN = "```"
+
+
+def validate_diff_response(text: str) -> str:
+    """Run the Phase 8 syntactic checks and return the cleaned text.
+
+    Raises ``LLMResponseError`` on any violation. Pass-through for the
+    ``ESCALATE: <reason>`` form so the caller can recognise it.
+
+    Markdown-fence detection is line-anchored: a wrapping fence (``\\`\\`\\```)
+    appears as the first character of a line. Unified-diff payload lines
+    always start with ``+``, ``-``, or `` `` (context space), so a payload
+    line that *contains* triple backticks (a docstring example, a markdown
+    code fence inside the changed file) doesn't trigger a false positive.
+    """
+    stripped = text.strip()
+    if stripped.startswith("ESCALATE:"):
+        return stripped
+    for line in stripped.splitlines():
+        if line.startswith(_FENCE_TOKEN):
+            raise LLMResponseError("response contained a markdown fence")
+    if not _DIFF_HEADER_RE.search(stripped):
+        raise LLMResponseError("response is not a unified diff")
+    return stripped
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)

@@ -48,6 +48,18 @@ class ReviewThread:
         """Convenience: the line of the root comment."""
         return self.comments[0].line if self.comments else None
 
+    @property
+    def location(self) -> str:
+        """Render the thread's location as ``path:line`` / ``path`` /
+        ``(no path)``. Used by run-summary reporting, batched-prompt
+        rendering, and human-escalation listings — keep in one place
+        so the three contexts stay consistent."""
+        if not self.path:
+            return "(no path)"
+        if self.line is not None:
+            return f"{self.path}:{self.line}"
+        return self.path
+
 
 # --- Classification --------------------------------------------------------
 
@@ -161,7 +173,9 @@ class ValidateCommand:
 
 
 @dataclass
-class ValidationResult:
+class CommandResult:
+    """Result of running a single validation command."""
+
     name: str
     ok: bool
     exit_code: int
@@ -170,7 +184,49 @@ class ValidationResult:
     duration_s: float = 0.0
 
 
+@dataclass
+class ValidationResult:
+    """Aggregate result of running all configured validation commands.
+
+    The Phase 10 spec wraps individual command results in this top-level
+    object with an explicit ``success`` flag. ``success`` is False if any
+    command failed.
+    """
+
+    success: bool
+    command_results: list[CommandResult] = field(default_factory=list)
+
+    @property
+    def first_failure(self) -> CommandResult | None:
+        return next((c for c in self.command_results if not c.ok), None)
+
+
 # --- Round / report --------------------------------------------------------
+
+
+@dataclass
+class HandledThread:
+    """A thread the agent successfully fixed in a given round.
+
+    Used by the end-of-run summary comment to render the 'Handled:' section.
+    """
+
+    thread_id: str
+    location: str  # e.g. "src/foo.py:42" or "(no path)"
+    summary: str  # the LLM's per-patch summary line
+
+
+@dataclass
+class EscalatedThread:
+    """A thread routed to NEEDS_HUMAN by triage in a given round.
+
+    Used by the end-of-run summary comment to render the 'Escalated:' section.
+    Distinct from IGNORE / dedupe / LLM-error skips, which are not surfaced.
+    """
+
+    thread_id: str
+    location: str
+    reason: str  # rule keyword or LLM reason
 
 
 @dataclass
@@ -178,18 +234,23 @@ class RoundResult:
     round_no: int
     fixed_thread_ids: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
-    validation: list[ValidationResult] = field(default_factory=list)
+    handled: list[HandledThread] = field(default_factory=list)
+    escalated_to_human: list[EscalatedThread] = field(default_factory=list)
+    validation: ValidationResult = field(
+        default_factory=lambda: ValidationResult(success=True)
+    )
     commit_sha: str | None = None
     error: str | None = None
 
     @property
     def validation_ok(self) -> bool:
-        return all(v.ok for v in self.validation)
+        return self.validation.success
 
 
 class EscalationReason(StrEnum):
     MAX_ROUNDS = "max_rounds"
     REPEATED_VALIDATION_FAILURE = "repeated_validation_failure"
+    VALIDATION_FAILED = "validation_failed"
     NO_FIXABLE_THREADS = "no_fixable_threads"
     UNSAFE_PATCH = "unsafe_patch"
     RUNTIME_BUDGET_EXHAUSTED = "runtime_budget_exhausted"
@@ -254,6 +315,8 @@ class SafetyLimits:
     max_patch_lines: int = 800
     max_files_touched: int = 15
     max_runtime_minutes: int = 20
+    exit_on_validation_failure: bool = True
+    post_per_thread_replies: bool = True
 
 
 @dataclass

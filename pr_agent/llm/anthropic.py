@@ -9,11 +9,14 @@ from anthropic import Anthropic
 from ..models import Classification, Patch, ReviewThread
 from ._base import (
     CLASSIFY_SYSTEM,
+    GENERATE_PATCH_SYSTEM,
     PATCH_SYSTEM,
     format_classify_user,
+    format_generate_patch_user,
     format_patch_user,
     parse_classification,
     parse_patch,
+    validate_diff_response,
 )
 
 log = logging.getLogger(__name__)
@@ -57,6 +60,29 @@ class AnthropicProvider:
         # real-sized source files (then crashing patch JSON parsing).
         text = self._call(system=PATCH_SYSTEM, user=user, max_tokens=16000)
         return parse_patch(text, thread.id)
+
+    def generate_patch(
+        self,
+        *,
+        pr_title: str,
+        pr_body: str,
+        pr_diff: str,
+        comments: list[ReviewThread],
+        repo_context: str,
+        validation_commands: list[str],
+        prior_failure: str | None = None,
+    ) -> str:
+        user = format_generate_patch_user(
+            pr_title=pr_title,
+            pr_body=pr_body,
+            pr_diff=pr_diff,
+            comments=comments,
+            repo_context=repo_context,
+            validation_commands=validation_commands,
+            prior_failure=prior_failure,
+        )
+        text = self._call(system=GENERATE_PATCH_SYSTEM, user=user, max_tokens=16000)
+        return validate_diff_response(text)
 
     def _call(self, *, system: str, user: str, max_tokens: int) -> str:
         resp = self._client.messages.create(
