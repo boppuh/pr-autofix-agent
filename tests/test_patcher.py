@@ -333,6 +333,25 @@ def test_count_patch_lines_counts_payload_starting_with_double_dash():
     assert count_patch_lines(diff) == 2
 
 
+def test_extract_touched_files_handles_unquoted_ascii_space_path():
+    """Modern git (default core.quotePath=true) does NOT quote ASCII
+    spaces — it emits 'diff --git a/foo bar b/foo bar' literally and
+    appends a trailing tab to the --- /+++ rows. Both shapes must
+    parse so the safety layer sees the real path."""
+    diff = (
+        "diff --git a/src/my file.py b/src/my file.py\n"
+        "index 7d4290a..407de30 100644\n"
+        "--- a/src/my file.py\t\n"
+        "+++ b/src/my file.py\t\n"
+        "@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+    )
+    assert extract_touched_files(diff) == ["src/my file.py"]
+    # And the safety check sees the real path, not a truncated one.
+    assert violates_protected_paths(
+        extract_touched_files(diff), ["src/"]
+    ) is True
+
+
 def test_extract_touched_files_includes_rename_source():
     """Regression: a rename diff names distinct a-side and b-side paths.
     Without extracting the a-side, a protected source file could be

@@ -64,8 +64,52 @@ _DIFF_GIT_RE = re.compile(
     r'^diff --git (?:a/(\S+)|"a/((?:[^"\\]|\\.)*)")'
     r' (?:b/(\S+)|"b/((?:[^"\\]|\\.)*)")$'
 )
-_PLUS_HEADER_RE = re.compile(r'^\+\+\+ (?:b/(\S+)|"b/((?:[^"\\]|\\.)*)")$')
-_MINUS_HEADER_RE = re.compile(r'^--- (?:a/(\S+)|"a/((?:[^"\\]|\\.)*)")$')
+# ``--- a/X`` / ``+++ b/Y`` lines: in the plain-path form, modern git
+# (default ``core.quotePath=true``) emits a trailing ``\t<timestamp>``
+# even for a clean diff (the timestamp is empty for tracked files but
+# the tab separator is still there). ``[^\t]+`` captures the path up
+# to the tab; ``(?:\t.*)?`` consumes the optional trailing field.
+# Plain ASCII paths-with-spaces parse here too, since we no longer
+# require ``\S+``.
+_PLUS_HEADER_RE = re.compile(
+    r'^\+\+\+ (?:b/([^\t]+)|"b/((?:[^"\\]|\\.)*)")(?:\t.*)?$'
+)
+_MINUS_HEADER_RE = re.compile(
+    r'^--- (?:a/([^\t]+)|"a/((?:[^"\\]|\\.)*)")(?:\t.*)?$'
+)
+
+
+def _parse_diff_git_line(line: str) -> tuple[str, str] | None:
+    """Extract ``(a_path, b_path)`` from a ``diff --git`` header line.
+
+    Two cases:
+
+    1. Strict regex match: handles plain unspaced paths and the
+       quoted-path form.
+    2. Fallback for the unquoted-with-ASCII-space case: modern git
+       emits ``diff --git a/PATH b/PATH`` literally, with no quoting
+       and no escaping. The space-containing path makes
+       ``\\S+ \\S+`` ambiguous — but git always repeats the same
+       path twice for non-rename diffs. Find a ``" b/"`` split point
+       where the a-side equals the b-side and use that.
+    """
+    m = _DIFF_GIT_RE.match(line)
+    if m:
+        return (
+            _path_from_match(m.group(1), m.group(2)),
+            _path_from_match(m.group(3), m.group(4)),
+        )
+    body = line.removeprefix("diff --git a/")
+    if body == line:
+        return None
+    sep = " b/"
+    idx = body.find(sep)
+    while idx != -1:
+        a, b = body[:idx], body[idx + len(sep) :]
+        if a and a == b:
+            return (a, b)
+        idx = body.find(sep, idx + 1)
+    return None
 
 # Standard C-style single-char escapes git emits in quoted paths.
 _QUOTED_SHORT_ESCAPES = {
@@ -207,10 +251,10 @@ def _iter_diff_sections(diff_text: str) -> list[FileSection]:
             _flush()
             started = True
             in_header = True
-            m = _DIFF_GIT_RE.match(line)
-            if m:
-                _add(a_paths, _path_from_match(m.group(1), m.group(2)))
-                _add(b_paths, _path_from_match(m.group(3), m.group(4)))
+            ab = _parse_diff_git_line(line)
+            if ab is not None:
+                _add(a_paths, ab[0])
+                _add(b_paths, ab[1])
             continue
         if line.startswith("@@"):
             in_header = False
