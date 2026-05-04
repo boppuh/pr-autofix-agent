@@ -12,6 +12,10 @@ from .models import Classification, ClassificationLabel, Patch, PatchFile, Revie
 
 log = logging.getLogger(__name__)
 
+
+class LLMResponseError(Exception):
+    """LLM returned text that did not decode to a JSON object."""
+
 _CLASSIFY_SYSTEM = """You triage Cursor Bugbot PR review comments.
 
 Decide whether a comment is AUTO-FIXABLE (small, mechanical, scoped) or HUMAN-REQUIRED
@@ -56,10 +60,10 @@ class LLMClient:
             user=user,
             max_tokens=400,
         )
-        data = _extract_json(text)
         try:
+            data = _extract_json(text)
             return Classification.model_validate(data)
-        except ValidationError as e:
+        except (LLMResponseError, ValidationError) as e:
             log.warning("Classifier returned invalid JSON: %s; raw=%r", e, text[:300])
             return Classification(
                 label=ClassificationLabel.HUMAN_REQUIRED,
@@ -73,9 +77,22 @@ class LLMClient:
         file_contents: dict[str, str],
         max_files: int,
         prior_failure: str | None = None,
+        pr_title: str | None = None,
+        pr_body_excerpt: str | None = None,
+        pr_diff_excerpt: str | None = None,
     ) -> Patch:
-        user = _format_patch_user(thread, file_contents, max_files, prior_failure)
-        text = self._call(system=_PATCH_SYSTEM, user=user, max_tokens=4000)
+        user = _format_patch_user(
+            thread,
+            file_contents,
+            max_files,
+            prior_failure,
+            pr_title=pr_title,
+            pr_body_excerpt=pr_body_excerpt,
+            pr_diff_excerpt=pr_diff_excerpt,
+        )
+        # Patches must include full file contents, so give the model headroom.
+        # 4000 was hitting truncation on real-sized source files.
+        text = self._call(system=_PATCH_SYSTEM, user=user, max_tokens=16000)
         data = _extract_json(text)
         files_raw = data.get("files") or []
         files = [PatchFile.model_validate(f) for f in files_raw]
@@ -123,8 +140,27 @@ def _format_patch_user(
     file_contents: dict[str, str],
     max_files: int,
     prior_failure: str | None,
+    *,
+    pr_title: str | None = None,
+    pr_body_excerpt: str | None = None,
+    pr_diff_excerpt: str | None = None,
 ) -> str:
-    parts = [
+    parts: list[str] = []
+    if pr_title:
+        parts += [f"PR title: {pr_title}"]
+    if pr_body_excerpt:
+        parts += ["", "PR description:", pr_body_excerpt]
+    if pr_diff_excerpt:
+        parts += [
+            "",
+            "PR diff (truncated):",
+            "```diff",
+            pr_diff_excerpt,
+            "```",
+        ]
+    if parts:
+        parts.append("")  # blank line separator only when prior context exists
+    parts += [
         f"Thread path: {thread.path or '(none)'}",
         f"Thread line: {thread.line if thread.line is not None else '(none)'}",
         f"File budget: at most {max_files} file(s).",
@@ -132,6 +168,8 @@ def _format_patch_user(
         "Comment thread:",
         thread.body_text,
     ]
+    if thread.comments and thread.comments[0].diff_hunk:
+        parts += ["", "Diff hunk for the thread:", "```diff", thread.comments[0].diff_hunk, "```"]
     if prior_failure:
         parts += [
             "",
@@ -159,4 +197,4 @@ def _extract_json(text: str) -> dict[str, Any]:
                 return obj
         except json.JSONDecodeError:
             continue
-    raise ValueError(f"LLM did not return valid JSON object: {text[:200]!r}")
+    raise LLMResponseError(f"LLM did not return valid JSON object: {text[:200]!r}")
