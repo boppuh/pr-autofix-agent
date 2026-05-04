@@ -123,7 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         excerpts = _gather_excerpts(gh, threads, head_ref)
         triage = classifier.triage(threads, excerpts)
         round_result = RoundResult(round_no=round_no)
+        # NEEDS_HUMAN threads are tracked as skipped (they keep the PR labelled
+        # for review). IGNORE threads are recorded but won't drive escalation.
         round_result.skipped.extend((t.id, r) for t, r in triage.skipped)
+        round_result.skipped.extend((t.id, r) for t, r in triage.ignored)
 
         if not triage.fixable:
             log.info("No auto-fixable threads remaining.")

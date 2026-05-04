@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
-from pydantic import ValidationError
 
 from .models import SafetyLimits, TargetRepoConfig, ValidateCommand, WorkflowInputs
 
@@ -87,15 +86,13 @@ def load_target_repo_config(repo_root: Path) -> TargetRepoConfig:
     )
 
     try:
-        return TargetRepoConfig.model_validate(
-            {
-                "validate": commands,
-                "protected_paths": protected,
-                "safety": safety,
-                "bugbot_logins": bugbot_logins,
-            }
+        return TargetRepoConfig(
+            validate_=commands,
+            protected_paths=protected,
+            safety=safety,
+            bugbot_logins=bugbot_logins,
         )
-    except ValidationError as e:
+    except (TypeError, ValueError) as e:
         raise ConfigError(f"Invalid {DEFAULT_CONFIG_FILENAME}: {e}") from e
 
 

@@ -38,7 +38,7 @@ class OpenAIProvider:
             cache_key="pr-agent/classify",
             max_output_tokens=400,
         )
-        return parse_classification(text)
+        return parse_classification(text, thread_id=thread.id)
 
     def propose_patch(
         self,

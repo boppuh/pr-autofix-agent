@@ -32,7 +32,7 @@ class AnthropicProvider:
             user=format_classify_user(thread, file_excerpt),
             max_tokens=400,
         )
-        return parse_classification(text)
+        return parse_classification(text, thread_id=thread.id)
 
     def propose_patch(
         self,
