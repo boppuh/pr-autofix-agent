@@ -1,14 +1,20 @@
 """Patch the working tree.
 
-The Phase 9 spec exposes four module-level free functions:
+Module-level free functions:
 
 - :func:`extract_touched_files` — every path the diff names (union of
-  ``diff --git`` and ``+++ b/`` headers).
+  ``diff --git`` headers, ``--- a/X`` lines, and ``+++ b/Y`` lines).
 - :func:`count_patch_lines` — payload +/- line count.
 - :func:`violates_protected_paths` — predicate against a protected-path list.
-- :func:`apply_unified_diff` — full apply pipeline (guards, ``git apply
-  --check``, ``git apply``, post-apply ``git diff --check``, revert on
-  failure). Returns ``True`` on success, ``False`` on any rejection.
+- :func:`apply_unified_diff` — full Phase 9 apply pipeline: runs the
+  safety guards (file count, protected paths, line limits) then
+  delegates the git work to :func:`apply_diff_to_repo`. Returns
+  ``True`` on success, ``False`` on any rejection.
+- :func:`apply_diff_to_repo` — git-only helper: ``git apply --check``,
+  ``git apply``, post-apply ``git diff --check``, revert on failure.
+  Callers must run their own guards. Used by both
+  :func:`apply_unified_diff` and :meth:`Patcher.apply_diff` so the
+  temp-file handling and revert ordering live in one place.
 
 The :class:`Patcher` class wraps the same primitives and translates
 rejections into typed :class:`UnsafePatchError` exceptions so the run
@@ -379,19 +385,42 @@ def apply_unified_diff(
         )
         return False
 
-    return _run_git_apply_pipeline(diff_text, repo_root=repo_root, files=files)
+    return apply_diff_to_repo(diff_text, repo_root=repo_root, files=files)
 
 
-def _run_git_apply_pipeline(
+def apply_diff_to_repo(
     diff_text: str, *, repo_root: Path, files: list[str]
 ) -> bool:
-    """Run ``git apply --check``, ``git apply``, and post-apply ``git diff
-    --check`` (with revert-on-failure) against ``repo_root``.
+    """Apply a unified diff to a repository's working tree.
 
-    Callers MUST run their own safety guards (file count, protected paths,
-    line limits, etc.) before invoking this — the pipeline does only the
-    git-level work. Returns ``True`` on a clean apply, ``False`` on any
-    git-level rejection (logs the reason at INFO).
+    Runs the git-level pipeline only:
+
+    1. ``git apply --check`` — pre-flight, no mutation on failure.
+    2. ``git apply`` — apply for real. On failure, best-effort
+       ``git apply --reverse`` to clean up any partial mutation
+       (``git apply`` is documented atomic, but the revert is cheap
+       insurance).
+    3. ``git diff --check`` (post-apply, scoped to ``files``) — catches
+       whitespace errors and merge-conflict markers (``<<<<<<<``,
+       ``=======``, ``>>>>>>>``) that ``--check`` at the patch level
+       can't see because they parse as valid diff hunks. On failure,
+       reverse-applies and returns False.
+
+    Returns ``True`` on a clean apply (working tree mutated), ``False``
+    on any git-level rejection (logs the reason at INFO).
+
+    Safety guards (file count, protected paths, line limits, …) are
+    explicitly NOT this function's responsibility — callers must run
+    their own. Two callers exist:
+
+    - :func:`apply_unified_diff` — the spec free function with its
+      own guard list.
+    - :meth:`Patcher.apply_diff` — the class wrapper with project-
+      specific :data:`FORBIDDEN_GLOBS` on top.
+
+    Both run their guards then delegate here. Keeping the git work in
+    one place means there's a single owner of the temp-file handling,
+    revert ordering, and ``--check`` scoping.
     """
     with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as tmp:
         tmp.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
@@ -400,12 +429,12 @@ def _run_git_apply_pipeline(
         try:
             _run_git(["apply", "--check", tmp_path], cwd=repo_root)
         except RuntimeError as e:
-            log.info("apply pipeline: git apply --check failed: %s", e)
+            log.info("apply_diff_to_repo: git apply --check failed: %s", e)
             return False
         try:
             _run_git(["apply", tmp_path], cwd=repo_root)
         except RuntimeError as e:
-            log.info("apply pipeline: git apply failed: %s", e)
+            log.info("apply_diff_to_repo: git apply failed: %s", e)
             # git apply is documented as atomic but defensive: if anything
             # did mutate before the failure, reverse-apply so the per-thread
             # fallback starts from a clean tree. Best-effort — a failed
@@ -422,19 +451,19 @@ def _run_git_apply_pipeline(
         try:
             _run_git(["diff", "--check", "--"] + files, cwd=repo_root)
         except RuntimeError as e:
-            log.info("apply pipeline: git diff --check failed; reverting: %s", e)
+            log.info("apply_diff_to_repo: git diff --check failed; reverting: %s", e)
             try:
                 _run_git(["apply", "--reverse", tmp_path], cwd=repo_root)
             except RuntimeError as revert_err:  # working tree now in unknown state
                 log.warning(
-                    "apply pipeline: revert via git apply --reverse FAILED (%s); "
+                    "apply_diff_to_repo: revert via git apply --reverse FAILED (%s); "
                     "working tree may be inconsistent",
                     revert_err,
                 )
             return False
     finally:
         Path(tmp_path).unlink(missing_ok=True)
-    log.info("apply pipeline: applied %d file(s)", len(files))
+    log.info("apply_diff_to_repo: applied %d file(s)", len(files))
     return True
 
 
@@ -537,7 +566,7 @@ class Patcher:
         # to the shared pipeline. We bypass apply_unified_diff to avoid
         # re-running the safety guards we just performed (file count,
         # protected paths, line limits) — the pipeline only touches git.
-        ok = _run_git_apply_pipeline(
+        ok = apply_diff_to_repo(
             diff_text, repo_root=self._root, files=files
         )
         if not ok:
