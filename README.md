@@ -13,14 +13,19 @@ It runs as a **reusable GitHub Actions workflow** plus a small Python agent that
 
 ## Installing in a target repo
 
-1. Optionally create `.pr-agent.yml` at the repo root (see `.pr-agent.yml.example`). Defaults: npm validation commands, standard `protected_paths`, Bugbot logins `cursor` / `bugbot` / `cursor-bugbot`.
-2. Add a calling workflow:
+1. **Add the secret.** In the target repo: Settings → Secrets and variables → Actions → New repository secret. Add `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` if you'll set `provider: openai`).
+2. **Optional: drop `.pr-agent.yml`** at the repo root. See [`.pr-agent.yml.example`](.pr-agent.yml.example) for the full schema. Defaults: npm validation commands, standard `protected_paths`, Bugbot logins `cursor` / `bugbot` / `cursor-bugbot` / `cursor[bot]`. Only the `validation.commands` field is project-specific in practice — set them to whatever your CI runs.
+3. **Add a calling workflow** that fires on Bugbot activity and delegates to the reusable workflow:
 
 ```yaml
 # .github/workflows/pr-autofix.yml
 name: PR Autofix
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
   pull_request_review_comment:
     types: [created]
   workflow_dispatch:
@@ -36,18 +41,25 @@ permissions:
 
 jobs:
   autofix:
-    uses: <your-org>/pr-autofix-agent/.github/workflows/pr-autofix-agent.yml@v1
+    # Skip fork PRs: secrets aren't available there, and the agent cannot
+    # push back to the fork's head ref.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: boppuh/pr-autofix-agent/.github/workflows/pr-autofix-agent.yml@main
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
-    with:
-      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
-      provider: anthropic  # or "openai"
+      provider: anthropic   # or "openai"
+      # Optional: pin the agent to a specific tag/sha for reproducibility.
+      # agent_ref: v1
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 ```
 
 > Set whichever secret matches your `provider:`. The other can be omitted.
+
+That's it. Bugbot review activity → workflow fires → agent triages, patches, validates, and pushes a commit back to the PR branch.
+
+**Alternative: direct install** without the reusable workflow. If you'd rather vendor the steps into the calling repo (e.g. to customise the Python version or pre/post steps), copy [`.github/workflows/autofix-on-pr.yml`](.github/workflows/autofix-on-pr.yml) and replace `pip install -e ".[dev]"` with `pip install "git+https://github.com/boppuh/pr-autofix-agent@main"`.
 
 The reusable workflow uses the standard `GITHUB_TOKEN`. **It never uses `pull_request_target`** — patches are applied to the PR head ref under least-privilege scopes.
 
@@ -76,6 +88,7 @@ The reusable workflow uses the standard `GITHUB_TOKEN`. **It never uses `pull_re
 | `dry_run` | `false` | Generate patches but skip commit/push |
 | `needs_human_label` | `needs-human` | Label applied on escalation |
 | `confidence_threshold` | `0.7` | Minimum classifier confidence to attempt a fix |
+| `agent_ref` | `main` | Git ref of `pr-autofix-agent` to install — branch, tag, or sha. Pin to a tag for reproducibility. |
 
 `.pr-agent.yml` (in target repo, all sections optional):
 
