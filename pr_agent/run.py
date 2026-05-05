@@ -139,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
             threads = threads[: safety.max_comments_per_round]
 
         excerpts = _gather_excerpts(gh, threads, head_ref)
-        triage = classifier.triage(threads, excerpts)
+        triage = classifier.triage(threads, excerpts, prior_failure=last_failure)
         round_result = RoundResult(round_no=round_no)
         # NEEDS_HUMAN threads are tracked as skipped (they keep the PR labelled
         # for review). IGNORE threads are recorded but won't drive escalation.

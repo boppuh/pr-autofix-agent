@@ -166,6 +166,7 @@ class Classifier:
         self,
         threads: list[ReviewThread],
         file_excerpts: dict[str, str | None],
+        prior_failure: str | None = None,
     ) -> TriageOutcome:
         fixable: list[ReviewThread] = []
         skipped: list[tuple[ReviewThread, str]] = []
@@ -175,7 +176,12 @@ class Classifier:
             if ruled is not None:
                 self._route(t, ruled, fixable, skipped, ignored)
                 continue
-            cls = self._llm.classify(t, file_excerpts.get(t.id))
+            # When a previous round's patch failed validation, pass the
+            # failure to the classifier — a thread that looked like an
+            # easy AUTO_FIX may turn out to need human judgment. Rule-
+            # classified threads (protected paths, etc.) skip this path
+            # by design; their answer doesn't depend on prior attempts.
+            cls = self._llm.classify(t, file_excerpts.get(t.id), prior_failure)
             decision = self._apply_threshold(cls)
             self._route(t, decision, fixable, skipped, ignored)
         log.info(

@@ -94,6 +94,25 @@ def test_anthropic_classify_legacy_label_mapping(monkeypatch):
     assert cls.category == "AUTO_FIX"
 
 
+def test_anthropic_classify_includes_prior_failure_in_prompt(monkeypatch):
+    """When a previous round's patch failed validation, the failure
+    text must reach the classifier — a thread that looked auto-fixable
+    last round may need re-routing to NEEDS_HUMAN."""
+    from pr_agent.llm import anthropic as a_mod
+
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = _anthropic_text_response(
+        '{"category": "NEEDS_HUMAN", "confidence": 0.9, "reason": "x"}'
+    )
+    monkeypatch.setattr(a_mod, "Anthropic", lambda **kw: fake_client)
+
+    p = make_provider("anthropic", model="m", api_key="k")
+    p.classify(_thread(), file_excerpt=None, prior_failure="ruff: F401 unused import")
+    user_msg = fake_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "Validation failure from a previous round" in user_msg
+    assert "ruff: F401 unused import" in user_msg
+
+
 def test_anthropic_propose_patch(monkeypatch):
     from pr_agent.llm import anthropic as a_mod
 
