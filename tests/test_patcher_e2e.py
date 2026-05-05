@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from pr_agent.patcher import Patcher, UnsafePatchError
+from pr_agent.patcher import Patcher, UnsafePatchError, apply_diff_to_repo
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -320,6 +320,24 @@ def test_apply_real_diff_too_many_files_rejected(repo: Path) -> None:
     with pytest.raises(UnsafePatchError, match="too many files"):
         _patcher(repo, max_files=2).apply_diff(diff, ["T1"])
     assert not any((repo / "src" / f"f{i}.py").exists() for i in range(4))
+
+
+def test_apply_diff_to_repo_runs_no_guards(repo: Path) -> None:
+    """The git-only helper does NO safety guards by design — callers
+    own that. Verify it'll happily apply a diff that violates a
+    project-level guard like protected paths or file count limits,
+    so the layering (guards in caller, git work here) is honest."""
+    target = repo / "src" / "hello.py"
+    target.write_text("def hello():\n    return 7\n")
+    diff = _diff(repo)
+    _git("checkout", "--", "src/hello.py", cwd=repo)
+
+    # Caller passes empty file list to skip the post-apply diff --check
+    # filter — that scoping is the only behavior tied to ``files``. The
+    # apply still happens.
+    ok = apply_diff_to_repo(diff, repo_root=repo, files=["src/hello.py"])
+    assert ok is True
+    assert target.read_text() == "def hello():\n    return 7\n"
 
 
 def test_apply_real_diff_unrelated_to_committed_state_fails_check(repo: Path) -> None:
