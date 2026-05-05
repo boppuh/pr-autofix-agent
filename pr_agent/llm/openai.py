@@ -35,10 +35,15 @@ class OpenAIProvider:
         self._client = OpenAI(api_key=api_key) if api_key else OpenAI()
         self._model = model
 
-    def classify(self, thread: ReviewThread, file_excerpt: str | None) -> Classification:
+    def classify(
+        self,
+        thread: ReviewThread,
+        file_excerpt: str | None,
+        prior_failure: str | None = None,
+    ) -> Classification:
         text = self._call(
             system=CLASSIFY_SYSTEM,
-            user=format_classify_user(thread, file_excerpt),
+            user=format_classify_user(thread, file_excerpt, prior_failure),
             cache_key="pr-agent/classify",
             max_output_tokens=400,
         )

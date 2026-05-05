@@ -191,6 +191,31 @@ def test_no_rule_match_falls_through_to_llm(thread_factory):
     assert len(out.fixable) == 1
 
 
+def test_triage_forwards_prior_failure_to_llm(thread_factory):
+    """When a previous round's patch failed validation, triage must
+    pass the failure text through to the LLM classifier so it can
+    reconsider whether the thread is genuinely auto-fixable."""
+    c, llm = _classifier()
+    llm.classify.return_value = Classification(
+        thread_id="T_1", category="NEEDS_HUMAN", reason="reconsidered", confidence=0.9
+    )
+    t = thread_factory(body="This function is interesting; could you double-check it?")
+    failure_text = "ruff: F401 unused import in src/foo.py"
+    c.triage([t], file_excerpts={t.id: ""}, prior_failure=failure_text)
+    # Third positional arg is prior_failure; assert it propagated.
+    args, kwargs = llm.classify.call_args
+    assert (args[2] if len(args) > 2 else kwargs.get("prior_failure")) == failure_text
+
+
+def test_triage_does_not_send_prior_failure_to_rule_classified_threads(thread_factory):
+    """Rule-classified threads (e.g. protected paths) bypass the LLM
+    entirely — prior_failure has nothing to influence."""
+    c, llm = _classifier(protected_paths=["infra/"])
+    t = thread_factory(body="x", path="infra/main.tf")  # protected by rule
+    c.triage([t], file_excerpts={t.id: ""}, prior_failure="anything")
+    llm.classify.assert_not_called()
+
+
 def test_low_confidence_llm_auto_fix_routed_to_human(thread_factory):
     """The threshold gate still applies to LLM-emitted AUTO_FIX (rule-emitted
     AUTO_FIX is at confidence 1.0 and bypasses the gate)."""

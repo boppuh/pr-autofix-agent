@@ -74,7 +74,12 @@ class LLMResponseError(Exception):
 class LLMProvider(Protocol):
     """Every concrete provider exposes the same triage/patch surface."""
 
-    def classify(self, thread: ReviewThread, file_excerpt: str | None) -> Classification: ...
+    def classify(
+        self,
+        thread: ReviewThread,
+        file_excerpt: str | None,
+        prior_failure: str | None = None,
+    ) -> Classification: ...
 
     def propose_patch(
         self,
@@ -130,7 +135,11 @@ def parse_patch(raw_text: str, thread_id: str) -> Patch:
     return Patch.from_json(data, thread_id=thread_id)
 
 
-def format_classify_user(thread: ReviewThread, file_excerpt: str | None) -> str:
+def format_classify_user(
+    thread: ReviewThread,
+    file_excerpt: str | None,
+    prior_failure: str | None = None,
+) -> str:
     lines = [
         f"Path: {thread.path or '(none)'}",
         f"Line: {thread.line if thread.line is not None else '(none)'}",
@@ -140,6 +149,18 @@ def format_classify_user(thread: ReviewThread, file_excerpt: str | None) -> str:
     ]
     if file_excerpt:
         lines += ["", "File excerpt around the comment:", "```", file_excerpt, "```"]
+    if prior_failure:
+        # The previous round attempted to AUTO_FIX this kind of thread
+        # and the patch failed validation. Showing the failure lets the
+        # classifier reconsider whether this thread is genuinely
+        # auto-fixable or actually needs a human.
+        lines += [
+            "",
+            "Validation failure from a previous round (consider whether this thread is truly auto-fixable):",
+            "```",
+            prior_failure[-2000:],
+            "```",
+        ]
     return "\n".join(lines)
 
 
