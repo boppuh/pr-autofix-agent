@@ -37,6 +37,13 @@ on:
         required: false
         type: number
         default: 0.7
+      agent_ref:
+        description: |
+          Git ref of pr-autofix-agent to install (branch, tag, or sha).
+          Defaults to "main"; pin to a tag like "v1" for stability.
+        required: false
+        type: string
+        default: main
     secrets:
       ANTHROPIC_API_KEY:
         required: false
@@ -85,9 +92,7 @@ jobs:
       - name: Install pr-autofix-agent
         run: |
           python -m pip install --upgrade pip
-          # Pin via the calling repo's reference to this workflow.
-          pip install "git+https://github.com/${{ github.workflow_ref && github.repository_owner || github.repository_owner }}/pr-autofix-agent@${{ github.sha }}" \
-            || pip install "git+https://github.com/${{ github.repository_owner }}/pr-autofix-agent@main"
+          pip install "git+https://github.com/boppuh/pr-autofix-agent@${{ inputs.agent_ref }}"
 
       - name: Run agent
         env:
