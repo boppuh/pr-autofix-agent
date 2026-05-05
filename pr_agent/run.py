@@ -5,12 +5,13 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .classifier import Classifier
 from .config import ConfigError, load_target_repo_config, load_workflow_inputs, require_env
 from .github_client import GitHubClient
-from .llm import LLMResponseError, make_provider
+from .llm import LLMProvider, LLMResponseError, make_provider
 from .llm._factory import default_model_for, env_var_for
 from .models import (
     AgentRunReport,
@@ -20,8 +21,10 @@ from .models import (
     HandledThread,
     Patch,
     PatchFile,
+    PullRequest,
     ReviewThread,
     RoundResult,
+    SafetyLimits,
     WorkflowInputs,
 )
 from .patcher import Patcher, UnsafePatchError
@@ -31,6 +34,208 @@ from .validator import Validator
 log = logging.getLogger("pr_agent")
 
 REPEATED_FAILURE_LIMIT = 2
+
+
+@dataclass
+class RoundAttempt:
+    """What a fix-attempt strategy produced for one round.
+
+    Both the batched ``generate_patch`` strategy and the per-thread
+    ``propose_patch`` strategy produce this same shape, so the
+    downstream code (validation, commit, push, replies) doesn't need
+    to know which path ran.
+
+    - ``patches``: ``(thread, summary_patch)`` pairs. The batched path
+      pairs the same synthetic ``Patch`` with every thread; the per-
+      thread path pairs each thread with its own. Used to drive replies
+      and ``handled``-tracking.
+    - ``applied_paths``: every working-tree path that was mutated. Fed
+      to ``patcher.stage_and_commit`` and ``patcher.revert_uncommitted``.
+    - ``summary_lines``: commit-body lines, already formatted. Each
+      strategy decides how to render its own summary so the main loop
+      doesn't branch on which one ran.
+    - ``dry_run_terminate``: signals the main loop to record the round
+      and ``_finish()`` immediately instead of validating + committing.
+    """
+
+    patches: list[tuple[ReviewThread, Patch]] = field(default_factory=list)
+    applied_paths: list[Path] = field(default_factory=list)
+    summary_lines: list[str] = field(default_factory=list)
+    dry_run_terminate: bool = False
+
+
+def _attempt_batch_round(
+    *,
+    live_fixable: list[ReviewThread],
+    llm: LLMProvider,
+    patcher: Patcher,
+    state: AgentState,
+    repo_root: Path,
+    pr: PullRequest,
+    pr_diff: str,
+    validation_commands: list[str],
+    last_failure: str | None,
+    dry_run: bool,
+    round_no: int,
+) -> RoundAttempt | None:
+    """Try the Phase 8 batched ``generate_patch`` + ``apply_diff``.
+
+    Returns a :class:`RoundAttempt` on a successful apply (or on dry-
+    run with a non-empty diff). Returns ``None`` to fall through to
+    the per-thread strategy when the model declined / errored /
+    returned ``ESCALATE`` / produced an unsafe diff.
+
+    Side effects on success: increments per-thread attempt counts.
+    Logs reasons at INFO.
+    """
+    try:
+        repo_context = _build_repo_context(repo_root, live_fixable, budget=32_000)
+        diff = llm.generate_patch(
+            pr_title=pr.title,
+            pr_body=pr.body or "",
+            pr_diff=pr_diff,
+            comments=live_fixable,
+            repo_context=repo_context,
+            validation_commands=validation_commands,
+            prior_failure=last_failure,
+        )
+    except LLMResponseError as e:
+        log.info("Batch generate_patch rejected (%s); falling back to per-thread.", e)
+        return None
+    except Exception as e:  # provider-side errors
+        log.info("Batch generate_patch failed (%s); falling back to per-thread.", e)
+        return None
+
+    if diff is None or not diff.strip():
+        return None
+
+    if diff.startswith("ESCALATE:"):
+        # The batch model may decline for whole-batch reasons ("too many
+        # comments", "needs cross-file refactor") that don't apply per
+        # thread. Fall through so each thread still gets a real attempt.
+        reason = diff.removeprefix("ESCALATE:").strip() or "model returned ESCALATE"
+        log.info("Model escalated batch (%s); falling through to per-thread.", reason)
+        return None
+
+    if dry_run:
+        # Don't mutate anything via git apply, but DO record the
+        # attempts the batched call would have consumed and signal the
+        # main loop to terminate without committing.
+        log.info("[DRY RUN] would apply batched diff for %d thread(s)", len(live_fixable))
+        for t in live_fixable:
+            state.increment_attempt(t.id)
+        return RoundAttempt(dry_run_terminate=True)
+
+    try:
+        applied_paths = patcher.apply_diff(diff, [t.id for t in live_fixable])
+    except UnsafePatchError as e:
+        # Don't increment attempts here — the per-thread fallback will
+        # increment per thread as it actually consumes attempts.
+        log.info("Batched diff rejected by Patcher (%s); falling back.", e)
+        return None
+
+    for t in live_fixable:
+        state.increment_attempt(t.id)
+    rel_paths = [str(p.relative_to(repo_root)) for p in applied_paths]
+    synthetic = Patch(
+        thread_id=f"batch-r{round_no}",
+        files=[
+            PatchFile(path=p, new_content="", rationale="batched") for p in rel_paths
+        ],
+        summary=f"batched fix for {len(live_fixable)} thread(s)",
+    )
+    log.info("Batched patch applied: %d files", len(applied_paths))
+    ids = ", ".join(t.id for t in live_fixable)
+    return RoundAttempt(
+        patches=[(t, synthetic) for t in live_fixable],
+        applied_paths=applied_paths,
+        summary_lines=[f"- threads {ids}: {synthetic.summary}"],
+    )
+
+
+def _attempt_per_thread_round(
+    *,
+    live_fixable: list[ReviewThread],
+    llm: LLMProvider,
+    patcher: Patcher,
+    state: AgentState,
+    safety: SafetyLimits,
+    repo_root: Path,
+    pr: PullRequest,
+    pr_diff: str,
+    last_failure: str | None,
+    dry_run: bool,
+    round_result: RoundResult,
+) -> RoundAttempt | None:
+    """The Phase 5 per-thread ``propose_patch`` strategy.
+
+    Iterates ``live_fixable``, asks the LLM for a per-thread patch,
+    runs ``check_safe`` on each, and applies the safe ones. Mutates
+    ``round_result.skipped`` for per-thread skip reasons.
+
+    Returns a :class:`RoundAttempt` (possibly with ``dry_run_terminate``
+    set) when at least one safe patch was produced. Returns ``None``
+    when no patches survived — the caller breaks out of the round loop.
+    """
+    patches: list[tuple[ReviewThread, Patch]] = []
+    for thread in live_fixable:
+        file_contents = _collect_file_contents(repo_root, thread)
+        attempt_no = state.increment_attempt(thread.id)
+        log.info("Thread %s: per-thread attempt #%d", thread.id, attempt_no)
+        try:
+            patch = llm.propose_patch(
+                thread=thread,
+                file_contents=file_contents,
+                max_files=safety.max_files_touched,
+                prior_failure=last_failure,
+                pr_title=pr.title,
+                pr_body_excerpt=pr.body[:2000] if pr.body else None,
+                pr_diff_excerpt=pr_diff,
+            )
+        except LLMResponseError as e:
+            log.warning("LLM patch output unusable for thread %s: %s", thread.id, e)
+            round_result.skipped.append((thread.id, f"llm output unusable: {e}"))
+            continue
+        except Exception as e:
+            log.warning("LLM call failed for thread %s: %s", thread.id, e)
+            round_result.skipped.append((thread.id, f"llm error: {e}"))
+            continue
+        try:
+            report = patcher.check_safe(patch)
+        except UnsafePatchError as e:
+            round_result.skipped.append((thread.id, f"unsafe: {e}"))
+            continue
+        if not report.ok:
+            round_result.skipped.append(
+                (thread.id, f"unsafe: {'; '.join(report.reasons)}")
+            )
+            continue
+        patches.append((thread, patch))
+
+    if not patches:
+        return None
+
+    if dry_run:
+        for thread, patch in patches:
+            log.info(
+                "[DRY RUN] would patch %s for thread %s: %s",
+                patch.touched_paths(),
+                thread.id,
+                patch.summary,
+            )
+        return RoundAttempt(dry_run_terminate=True)
+
+    applied_paths: list[Path] = []
+    for _, patch in patches:
+        applied_paths.extend(patcher.apply(patch))
+    summary_lines = [
+        f"- thread {thread.id}: {patch.summary}" for thread, patch in patches
+    ]
+    return RoundAttempt(
+        patches=patches,
+        applied_paths=applied_paths,
+        summary_lines=summary_lines,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -196,124 +401,46 @@ def main(argv: list[str] | None = None) -> int:
             state.record_round(round_result)
             break
 
-        applied_paths: list[Path] = []
-        patches: list[tuple[ReviewThread, Patch]] = []
-        batch_used = False
-
-        # --- Phase 8: batched generate_patch first --------------------------
-        try:
-            repo_context = _build_repo_context(repo_root, live_fixable, budget=32_000)
-            diff = llm.generate_patch(
-                pr_title=pr.title,
-                pr_body=pr.body or "",
+        # Try the batched strategy first; on decline, fall through to
+        # per-thread. Both produce the same RoundAttempt shape so the
+        # downstream code (validate, commit, push, reply, resolve)
+        # doesn't branch on which path ran.
+        attempt = _attempt_batch_round(
+            live_fixable=live_fixable,
+            llm=llm,
+            patcher=patcher,
+            state=state,
+            repo_root=repo_root,
+            pr=pr,
+            pr_diff=pr_diff,
+            validation_commands=[c.run for c in repo_cfg.validate_],
+            last_failure=last_failure,
+            dry_run=inputs.dry_run,
+            round_no=round_no,
+        )
+        if attempt is None:
+            attempt = _attempt_per_thread_round(
+                live_fixable=live_fixable,
+                llm=llm,
+                patcher=patcher,
+                state=state,
+                safety=safety,
+                repo_root=repo_root,
+                pr=pr,
                 pr_diff=pr_diff,
-                comments=live_fixable,
-                repo_context=repo_context,
-                validation_commands=[c.run for c in repo_cfg.validate_],
-                prior_failure=last_failure,
+                last_failure=last_failure,
+                dry_run=inputs.dry_run,
+                round_result=round_result,
             )
-        except LLMResponseError as e:
-            log.info("Batch generate_patch rejected (%s); falling back to per-thread.", e)
-            diff = None
-        except Exception as e:  # provider-side errors
-            log.info("Batch generate_patch failed (%s); falling back to per-thread.", e)
-            diff = None
-
-        if diff and diff.startswith("ESCALATE:"):
-            # The batch model may decline for whole-batch reasons ("too many
-            # comments", "needs cross-file refactor") that don't apply to
-            # individual threads. Fall through to the per-thread path so
-            # each thread gets its own chance — don't burn attempts and
-            # skip the round.
-            reason = diff.removeprefix("ESCALATE:").strip() or "model returned ESCALATE"
-            log.info("Model escalated batch (%s); falling through to per-thread.", reason)
-            diff = None
-
-        if diff is not None:
-            # Dry-run check BEFORE we mutate anything via git apply.
-            if inputs.dry_run:
-                log.info(
-                    "[DRY RUN] would apply batched diff for %d thread(s)",
-                    len(live_fixable),
-                )
-                for t in live_fixable:
-                    state.increment_attempt(t.id)
-                state.record_round(round_result)
-                return _finish(gh, inputs.pr_number, state)
-            try:
-                applied_paths = patcher.apply_diff(diff, [t.id for t in live_fixable])
-            except UnsafePatchError as e:
-                # Don't increment attempts here — the per-thread fallback below
-                # will increment per thread as it actually consumes attempts.
-                log.info("Batched diff rejected by Patcher (%s); falling back.", e)
-                applied_paths = []
-                patches = []
-            else:
-                for t in live_fixable:
-                    state.increment_attempt(t.id)
-                # Synthesize a single Patch for the commit message + replies.
-                rel_paths = [str(p.relative_to(repo_root)) for p in applied_paths]
-                synthetic = Patch(
-                    thread_id=f"batch-r{round_no}",
-                    files=[PatchFile(path=p, new_content="", rationale="batched") for p in rel_paths],
-                    summary=f"batched fix for {len(live_fixable)} thread(s)",
-                )
-                patches = [(t, synthetic) for t in live_fixable]
-                batch_used = True
-                log.info("Batched patch applied: %d files", len(applied_paths))
-
-        # --- Per-thread fallback (Phase 5 path) -----------------------------
-        if not batch_used:
-            for thread in live_fixable:
-                file_contents = _collect_file_contents(repo_root, thread)
-                attempt_no = state.increment_attempt(thread.id)
-                log.info("Thread %s: per-thread attempt #%d", thread.id, attempt_no)
-                try:
-                    patch = llm.propose_patch(
-                        thread=thread,
-                        file_contents=file_contents,
-                        max_files=safety.max_files_touched,
-                        prior_failure=last_failure,
-                        pr_title=pr.title,
-                        pr_body_excerpt=pr.body[:2000] if pr.body else None,
-                        pr_diff_excerpt=pr_diff,
-                    )
-                except LLMResponseError as e:
-                    log.warning("LLM patch output unusable for thread %s: %s", thread.id, e)
-                    round_result.skipped.append((thread.id, f"llm output unusable: {e}"))
-                    continue
-                except Exception as e:
-                    log.warning("LLM call failed for thread %s: %s", thread.id, e)
-                    round_result.skipped.append((thread.id, f"llm error: {e}"))
-                    continue
-                try:
-                    report = patcher.check_safe(patch)
-                except UnsafePatchError as e:
-                    round_result.skipped.append((thread.id, f"unsafe: {e}"))
-                    continue
-                if not report.ok:
-                    round_result.skipped.append((thread.id, f"unsafe: {'; '.join(report.reasons)}"))
-                    continue
-                patches.append((thread, patch))
-
-            if not patches:
-                log.info("Round %d produced no safe patches.", round_no)
-                state.record_round(round_result)
-                break
-
-            if inputs.dry_run:
-                for thread, patch in patches:
-                    log.info(
-                        "[DRY RUN] would patch %s for thread %s: %s",
-                        patch.touched_paths(),
-                        thread.id,
-                        patch.summary,
-                    )
-                state.record_round(round_result)
-                return _finish(gh, inputs.pr_number, state)
-
-            for _, patch in patches:
-                applied_paths.extend(patcher.apply(patch))
+        if attempt is None:
+            log.info("Round %d produced no safe patches.", round_no)
+            state.record_round(round_result)
+            break
+        if attempt.dry_run_terminate:
+            state.record_round(round_result)
+            return _finish(gh, inputs.pr_number, state)
+        applied_paths = attempt.applied_paths
+        patches = attempt.patches
 
         round_result.validation = validator.run()
         if not round_result.validation_ok:
@@ -370,23 +497,9 @@ def main(argv: list[str] | None = None) -> int:
         author_email = os.environ.get(
             "GIT_AUTHOR_EMAIL", "pr-autofix-agent[bot]@users.noreply.github.com"
         )
-        # Aggregate one summary line per thread across the entire round so
-        # the commit body covers every fix, not just patches[0]. The batched
-        # path pairs the same synthetic Patch with every thread; collapse
-        # into one line per unique patch (keyed by thread_id) so the commit
-        # body doesn't repeat "batched fix for N thread(s)" N times.
-        seen_patch_ids: set[str] = set()
-        summary_lines: list[str] = []
-        for thread, patch in patches:
-            if patch.thread_id in seen_patch_ids:
-                continue
-            seen_patch_ids.add(patch.thread_id)
-            if batch_used:
-                ids = ", ".join(t.id for t, _ in patches)
-                summary_lines.append(f"- threads {ids}: {patch.summary}")
-            else:
-                summary_lines.append(f"- thread {thread.id}: {patch.summary}")
-        sha = patcher.stage_and_commit(summary_lines, applied_paths, author_email)
+        sha = patcher.stage_and_commit(
+            attempt.summary_lines, applied_paths, author_email
+        )
         if sha is None:
             log.info(
                 "Round %d: nothing to commit (patch was a no-op vs. working tree); "
